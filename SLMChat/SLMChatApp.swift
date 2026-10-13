@@ -105,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let store else { return .terminateNow }
         Task { @MainActor in
             await store.service.releaseSLMs()
+            await store.search.shutdown()
             UserDefaults.standard.synchronize()
             sender.reply(toApplicationShouldTerminate: true)
         }

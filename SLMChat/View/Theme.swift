@@ -242,3 +242,25 @@ extension View {
             .fixedSize()
     }
 }
+
+extension View {
+    /// Brief accent wash behind a message the user jumped to from search.
+    func searchFlash(_ on: Bool) -> some View {
+        background(Theme.accent.opacity(on ? 0.22 : 0), in: RoundedRectangle(cornerRadius: 12))
+            .animation(.easeOut(duration: 0.6), value: on)
+    }
+}
+
+enum SearchJump {
+    /// Scroll to the requested message (centred) and flash it for a moment.
+    static func perform(_ request: JumpRequest?, in ids: [UUID], proxy: ScrollViewProxy,
+                        flash: Binding<UUID?>) -> Bool {
+        guard let id = request?.messageID, ids.contains(id) else { return false }
+        withAnimation { proxy.scrollTo(id, anchor: .center) }
+        flash.wrappedValue = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            if flash.wrappedValue == id { flash.wrappedValue = nil }
+        }
+        return true
+    }
+}

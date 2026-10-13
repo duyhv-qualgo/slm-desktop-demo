@@ -22,7 +22,11 @@ import UniformTypeIdentifiers
 struct ChatView: View {
     @ObservedObject var conversation: Conversation
     @ObservedObject var store: ConversationStore
+    /// Set by sidebar search: scroll to this message and flash it.
+    var jump: JumpRequest? = nil
 
+    /// The message currently flashed after a search jump.
+    @State private var flashID: UUID?
     /// The contact-info panel on the right (the design's split-view toggle).
     @State private var showInfo = false
     /// A file is being dragged over the thread.
@@ -150,6 +154,7 @@ struct ChatView: View {
                                       onReport: { reason, note in
                                           conversation.report(message, reason: reason, note: note)
                                       })
+                        .searchFlash(flashID == message.id)
                         .id(message.id)
                         // Bulk history is appended unscreened, so this is what
                         // gets it classified — the row asks as it materializes,
@@ -183,6 +188,8 @@ struct ChatView: View {
                 // its unread neighbours below it, rather than being the last
                 // thing visible.
                 DispatchQueue.main.async {
+                    if SearchJump.perform(jump, in: conversation.messages.map(\.id),
+                                          proxy: proxy, flash: $flashID) { return }
                     let firstUnread = conversation.messages
                         .first { $0.sender == .friend && !$0.isRead }
                     if let firstUnread {
@@ -191,6 +198,10 @@ struct ChatView: View {
                         proxy.scrollTo(conversation.messages.last?.id, anchor: .bottom)
                     }
                 }
+            }
+            .onChange(of: jump) { request in
+                _ = SearchJump.perform(request, in: conversation.messages.map(\.id),
+                                       proxy: proxy, flash: $flashID)
             }
             .onChange(of: conversation.messages.count) { _ in
                 withAnimation { proxy.scrollTo(conversation.messages.last?.id, anchor: .bottom) }

@@ -5,6 +5,10 @@ import SwiftUI
 struct GroupChatView: View {
     @ObservedObject var group: GroupChat
     @ObservedObject var store: ConversationStore
+    /// Set by sidebar search: scroll to this message and flash it.
+    var jump: JumpRequest? = nil
+    /// The message currently flashed after a search jump.
+    @State private var flashID: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -216,6 +220,7 @@ struct GroupChatView: View {
                                       onReport: { reason, note in
                                           group.report(message, reason: reason, note: note)
                                       })
+                        .searchFlash(flashID == message.id)
                         .id(message.id)
                         // Same bulk path as ChatView: history is screened when it
                         // reaches the viewport, not when it arrives.
@@ -240,6 +245,8 @@ struct GroupChatView: View {
                 // The group had no open-scroll at all, so it always landed at the
                 // top of the history, which is the worst of both.
                 DispatchQueue.main.async {
+                    if SearchJump.perform(jump, in: group.messages.map(\.id),
+                                          proxy: proxy, flash: $flashID) { return }
                     let firstUnread = group.messages
                         .first { $0.sender == .friend && !$0.isRead }
                     if let firstUnread {
@@ -248,6 +255,10 @@ struct GroupChatView: View {
                         proxy.scrollTo(group.messages.last?.id, anchor: .bottom)
                     }
                 }
+            }
+            .onChange(of: jump) { request in
+                _ = SearchJump.perform(request, in: group.messages.map(\.id),
+                                       proxy: proxy, flash: $flashID)
             }
             .onChange(of: group.messages.count) { _ in
                 withAnimation { proxy.scrollTo(group.messages.last?.id, anchor: .bottom) }

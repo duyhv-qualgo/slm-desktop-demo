@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 
 /// The main window: a narrow icon rail, the inbox sidebar (search, filter chips,
 /// collapsible Group / Direct sections) and the selected chat. On iOS this was a
@@ -17,6 +18,8 @@ struct ConversationListView: View {
     }
 
     @State private var selection: Selection?
+    /// Message to scroll to in the opened chat, set by clicking a search result.
+    @State private var jump: JumpRequest?
     @State private var filter: Filter = .all
     @State private var query = ""
     @State private var groupExpanded = true
@@ -65,6 +68,8 @@ struct ConversationListView: View {
             case "group": selection = .group
             default: break
             }
+            // SLMCHAT_SEARCH="query" pre-fills the sidebar search.
+            if let q = ProcessInfo.processInfo.environment["SLMCHAT_SEARCH"] { query = q }
             #endif
         }
     }
@@ -165,6 +170,7 @@ struct ConversationListView: View {
                         if groupExpanded {
                             SidebarRow(selected: selection == .group) {
                                 selection = .group
+                                jump = nil
                             } content: {
                                 GroupRowContent(group: store.group)
                             }
@@ -176,6 +182,7 @@ struct ConversationListView: View {
                             ForEach(visibleConversations) { conversation in
                                 SidebarRow(selected: selection == .conversation(conversation)) {
                                     selection = .conversation(conversation)
+                                    jump = nil
                                 } content: {
                                     ConversationRowContent(conversation: conversation)
                                 }
@@ -187,6 +194,16 @@ struct ConversationListView: View {
                                     .foregroundStyle(Theme.textSecondary)
                                     .padding(.horizontal, 22).padding(.vertical, 6)
                             }
+                        }
+                    }
+                    if !trimmedQuery.isEmpty {
+                        MessageResultsSection(search: store.search, query: trimmedQuery,
+                                              selectedID: jump?.messageID) { hit in
+                            switch hit.location {
+                            case .group: selection = .group
+                            case .conversation(let c): selection = .conversation(c)
+                            }
+                            jump = JumpRequest(messageID: hit.id)
                         }
                     }
                 }
@@ -233,9 +250,10 @@ struct ConversationListView: View {
         }
     }
 
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespaces) }
+
     private func matches(_ text: String) -> Bool {
-        let q = query.trimmingCharacters(in: .whitespaces)
-        return q.isEmpty || text.localizedCaseInsensitiveContains(q)
+        trimmedQuery.isEmpty || text.localizedCaseInsensitiveContains(trimmedQuery)
     }
 
     @ViewBuilder
@@ -276,11 +294,11 @@ struct ConversationListView: View {
     private var detail: some View {
         switch selection {
         case .group:
-            GroupChatView(group: store.group, store: store)
+            GroupChatView(group: store.group, store: store, jump: jump)
         case .conversation(let conversation):
             // Fresh identity per chat, so `ChatView.onAppear/onDisappear` fire on
             // every switch — they drive `isActive`, auto-suggest and compose teardown.
-            ChatView(conversation: conversation, store: store)
+            ChatView(conversation: conversation, store: store, jump: jump)
                 .id(conversation.id)
         case nil:
             VStack(spacing: 10) {
@@ -413,6 +431,152 @@ private struct ConversationRowContent: View {
             UnreadBadge(count: conversation.unreadCount)
         }
         .help(conversation.lastMessagePreview)
+    }
+}
+
+/// "Messages" results under the chat list while searching: exact text matches
+/// first, then messages that match by meaning (on-device embeddings).
+private struct MessageResultsSection: View {
+    @ObservedObject var search: MessageSearch
+    let query: String
+    let selectedID: UUID?
+    let open: (MessageHit) -> Void
+
+    @State private var hits: [MessageHit] = []
+    @State private var expanded = true
+
+    var body: some View {
+        SectionHeader(title: "Messages", expanded: $expanded)
+            // Re-run as typing pauses, and as background indexing adds vectors.
+            .task(id: "\(query)|\(search.indexedCount)") {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                let found = await search.search(query)
+                if !Task.isCancelled { hits = found }
+            }
+        if expanded {
+            if search.isIndexing {
+                Label("Indexing \(search.indexedCount)/\(search.eligibleCount) messages…",
+                      systemImage: "sparkle.magnifyingglass")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 12).padding(.bottom, 4)
+            }
+            ForEach(hits) { hit in
+                MessageHitRow(hit: hit, query: query, selected: hit.id == selectedID) { open(hit) }
+            }
+            if hits.isEmpty {
+                Text(search.isAvailable ? "No messages found" : "No messages found · meaning search unavailable")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textSecondary)
+                    .padding(.horizontal, 22).padding(.vertical, 6)
+            }
+        }
+    }
+}
+
+private struct MessageHitRow: View {
+    let hit: MessageHit
+    let query: String
+    let selected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 10) {
+                if case .group = hit.location {
+                    AvatarCircle(name: hit.chatTitle, size: 26, systemImage: "person.3.fill", tint: .indigo)
+                } else {
+                    AvatarCircle(name: hit.chatTitle, size: 26)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(hit.chatTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                        if !hit.exact {
+                            Text(hit.viaPhoto ? "≈ in photo" : "≈ related")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(Theme.accent)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Theme.accent.opacity(0.14), in: Capsule())
+                                .help(hit.viaPhoto ? "Matched what's in the photo"
+                                                   : String(format: "Matched by meaning (similarity %.2f)", hit.score))
+                        }
+                        Spacer(minLength: 4)
+                        Text(DaySeparator.label(for: hit.message.date))
+                            .font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
+                    }
+                    HStack(alignment: .top, spacing: 8) {
+                        snippet
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Theme.textSecondary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: 0)
+                        // Never show a photo the guardrail would blur.
+                        if let id = hit.message.imageID, !hit.message.isSensitive {
+                            PhotoThumb(imageID: id)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Theme.rowSelected : hovering ? Theme.rowHover : .clear,
+                        in: RoundedRectangle(cornerRadius: 10))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    /// The message text, with the query in bold for exact matches. A message the
+    /// thread would blur shows its label instead, same as the inbox preview —
+    /// search must not print what the guardrail hides.
+    private var snippet: Text {
+        let m = hit.message
+        let who = m.sender == .you ? "You: " : (m.authorName.map { "\($0): " } ?? "")
+        if m.isSensitive {
+            return Text(who + "⚠️ " + (m.safety?.displayName ?? "Flagged"))
+        }
+        var body = m.text.isEmpty ? (m.hasImage ? "📷 Photo" : m.fileName.map { "📄 \($0)" } ?? "") : m.text
+        body = body.replacingOccurrences(of: "\n", with: " ")
+        var attributed = AttributedString(who + body)
+        if hit.exact, let r = attributed.range(of: query, options: .caseInsensitive) {
+            attributed[r].font = .system(size: 12.5, weight: .bold)
+            attributed[r].foregroundColor = .primary
+        }
+        return Text(attributed)
+    }
+}
+
+/// Small square preview of a stored photo, decoded off the main thread.
+private struct PhotoThumb: View {
+    let imageID: String
+    @State private var image: NSImage?
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Theme.field)
+            .overlay {
+                if let image {
+                    Image(nsImage: image).resizable().scaledToFill()
+                }
+            }
+            .frame(width: 40, height: 40)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .task(id: imageID) {
+                let url = ImageStore.url(for: imageID)
+                image = await Task.detached(priority: .utility) {
+                    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                          let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                              kCGImageSourceCreateThumbnailFromImageAlways: true,
+                              kCGImageSourceCreateThumbnailWithTransform: true,
+                              kCGImageSourceThumbnailMaxPixelSize: 120,
+                          ] as CFDictionary) else { return nil }
+                    return NSImage(cgImage: cg, size: .zero)
+                }.value
+            }
     }
 }
 

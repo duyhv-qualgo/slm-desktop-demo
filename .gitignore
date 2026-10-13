@@ -1,0 +1,15 @@
+# Build output and generated project (project.yml is the source of truth)
+build/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+.DS_Store
+__pycache__/
+
+# Binaries — supplied by scripts/bootstrap.sh (cloned from the iOS demo) and
+# scripts/build_tflite_macos.sh. Never commit models or frameworks.
+Frameworks/
+Resources/
+
+# Secrets
+APIConfig.plist

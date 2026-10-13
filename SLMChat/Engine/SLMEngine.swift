@@ -1,0 +1,542 @@
+import Foundation
+
+/// A turn in the conversation history handed to the model, as the C bridge
+/// expects it: `["role": "user"|"model", "text": "…"]`.
+typealias Turn = [String: String]
+
+/// Identifies which app feature a `SLMEngine.complete`/`stream` call serves.
+/// Tags the `[SLMPerf]` log line (via `description`, unchanged from the raw
+/// strings the codebase used before — existing log filters keep matching) and
+/// decides whether the call's KV prefix is worth caching (`isCacheable`, see
+/// the `cacheable` note on `ChatLM.h`).
+///
+/// This exists instead of a bare `String` so the valid label set is
+/// compiler-checked: a typo used to silently fall through to "not cacheable"
+/// with no warning, which is exactly the kind of bug that quietly regresses
+/// auto-suggest latency without anyone noticing. Add a case here — not a new
+/// string literal at the call site — when a new feature needs one.
+enum SLMFeatureLabel: Equatable, CustomStringConvertible {
+    /// Default for `-complete`, e.g. a one-shot call not naming a feature.
+    case complete
+    /// Default for `-stream`, e.g. a one-shot call not naming a feature.
+    case stream
+    /// Auto-reply suggestion chips (1:1 or group).
+    case suggest
+    /// Background prefill of the NEXT suggest's prompt, fired when the user
+    /// sends (see `Conversation.prewarmNextSuggest`). Generates nothing.
+    case suggestPrewarm
+    /// Whole-conversation or unread-window summary.
+    case summarize
+    /// One chunk of a long-message map-reduce summary. `phase` is a free-form
+    /// log tag ("MAP", "REDUCE#1", …) — see `ChatService.summarizeChunks`.
+    /// Always non-cacheable regardless of `phase`.
+    case summarizeChunk(phase: String)
+    /// Message translation.
+    case translate
+    /// Translating a search query for on-device image-tag lookup.
+    case translateQuery
+    /// Calendar/reminder event extraction.
+    case event
+    /// Magic Compose: rewriting the user's draft, or generating a reply from a
+    /// compose chip.
+    case compose
+
+    var description: String {
+        switch self {
+        case .complete:                    return "complete"
+        case .stream:                      return "stream"
+        case .suggest:                     return "suggest"
+        case .suggestPrewarm:              return "suggest-prewarm"
+        case .summarize:                   return "summarize"
+        case .summarizeChunk(let phase):   return "summarize-\(phase.lowercased())"
+        case .translate:                   return "translate"
+        case .translateQuery:              return "translate-query"
+        case .event:                       return "event"
+        case .compose:                     return "compose"
+        }
+    }
+
+    /// Whether this feature repeats a near-identical prompt across calls, so
+    /// its KV prefix is worth keeping in a slot of its own. Auto-suggest does;
+    /// everything else wraps a fresh prompt around a single message and never
+    /// sees it again, so caching gains nothing and would only evict the feature
+    /// that benefits. See the `cacheable` parameter note on `ChatLM.h`.
+    ///
+    /// `.compose` is false despite sharing auto-suggest's conversation block:
+    /// the chip's instruction sits in the FIRST line of the prompt and changes
+    /// with every tap, so the shared part is never a shared PREFIX. Marking it
+    /// cacheable would buy nothing and evict the auto-suggest prefix that the
+    /// 3 s budget depends on.
+    var isCacheable: Bool {
+        switch self {
+        case .suggest, .suggestPrewarm, .stream, .complete: return true
+        case .summarize, .summarizeChunk, .translate, .translateQuery,
+             .event, .compose: return false
+        }
+    }
+}
+
+/// User-selectable compute backend, chosen in Settings. `.auto` is the shipping
+/// default; the explicit cases exist so a device can be measured both ways
+/// without a rebuild — the CPU/GPU prefill gap is the whole latency question for
+/// auto-suggest.
+///
+/// Note `.gpu` is a REQUEST, not a guarantee: `ChatLM` forces CPU on the
+/// simulator (no Metal compute device) and when llama.cpp reports no gpu-offload
+/// support. The `[SLMPerf]` log lines report the backend actually in use.
+enum SLMBackendOption: String, CaseIterable, Identifiable {
+    case auto, gpu, cpu
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .gpu:  return "GPU"
+        case .cpu:  return "CPU"
+        }
+    }
+}
+
+/// Which llama.cpp backend the app's engines load on.
+///
+/// Metal is the default because PREFILL — not generation — dominates a turn: a
+/// ~480-token auto-suggest prompt costs seconds on CPU while the ~50-token
+/// answer costs far less, and prefill is a batched matmul, the workload a GPU is
+/// best at. (Decode is memory-bound and gains little either way.)
+///
+/// The catch: ggml's Metal backend calls `abort()` on init failure instead of
+/// returning an error, so a device where Metal init fails would crash on every
+/// launch, with the SLM features dead and no way to recover from inside the app.
+/// `preferred()` guards that with a probe flag: it's set just before a GPU load
+/// and cleared once the load returns. Finding it still set at the next launch
+/// means the previous attempt never returned — the process died inside Metal
+/// init — so the app falls back to CPU permanently instead of crash-looping.
+enum SLMBackend {
+    static let gpu = "gpu"
+    static let cpu = "cpu"
+
+    /// Set while a GPU load is in flight; survives the abort that would clear it.
+    private static let probeKey = "slm.gpuLoadInFlight"
+
+    /// True when a previous GPU load aborted, so the app is pinned to CPU. Drives
+    /// the Settings sheet's explanatory footer.
+    static var gpuProbeTripped: Bool {
+        UserDefaults.standard.bool(forKey: probeKey)
+    }
+
+    /// Backend for the app's own engines, honouring the user's Settings choice.
+    ///
+    /// `.auto` means GPU unless the crash guard tripped. An EXPLICIT `.gpu`
+    /// overrides the guard — the guard exists to stop an unattended crash loop,
+    /// not to overrule someone deliberately retrying it from Settings.
+    ///
+    /// The benchmark harness bypasses this and names a backend explicitly.
+    static func preferred(_ choice: SLMBackendOption = .auto) -> String {
+        switch choice {
+        case .cpu: return cpu
+        case .gpu: return gpu
+        case .auto:
+            if gpuProbeTripped {
+                NSLog("[SLMPerf] previous GPU load never returned (Metal init aborted) → using CPU")
+                return cpu
+            }
+            return gpu
+        }
+    }
+
+    /// Clear the tripped guard so GPU is attempted again — for a Settings-level
+    /// "retry GPU" affordance, or after shipping a fix.
+    static func resetGPUProbe() {
+        UserDefaults.standard.removeObject(forKey: probeKey)
+    }
+
+    /// Run `load` with the probe flag raised when it targets the GPU, so a Metal
+    /// abort inside it is still visible on the next launch.
+    static func guardingLoad<T>(backend: String, _ load: () -> T) -> T {
+        guard backend == gpu else { return load() }
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: probeKey)
+        // Force the write to disk NOW: an abort inside load() gives no chance to
+        // flush later, and an unflushed flag guards nothing.
+        defaults.synchronize()
+        let result = load()
+        defaults.removeObject(forKey: probeKey)
+        return result
+    }
+}
+
+/// Serialized async wrapper around one `ChatLM` (llama.cpp / GGUF model).
+/// Every generation runs on one private serial queue, so requests to this engine
+/// queue and run one at a time.
+///
+/// The app runs ONE of these — the task finetune behind translate / suggest /
+/// summarize / event / guardrail. There was a second for the chat partner's own
+/// replies; those come from `ChatAPI` now, and that engine is gone.
+///
+/// `ChatLM` renders a real system prompt + role-tagged history + the latest user
+/// turn through the GGUF model's embedded chat template, so the model sees proper
+/// multi-turn structure. Single-turn tasks pass `system: nil, history: []`.
+final class SLMEngine {
+
+    /// Emit a `[SLMPerf]` line per generation (prefill/decode split, token counts,
+    /// tok/s, latency). On by default — the lines are one per model call, and the
+    /// auto-suggest latency budget is measured from them. Set to false to silence.
+    static var logPerf = true
+
+    private let namespace: String
+    private let queue: DispatchQueue
+    private var bridge: ChatLM?
+    /// Bundle basename of the currently loaded checkpoint, for the perf log.
+    private(set) var loadedModelName: String = "-"
+
+    /// Backend the loaded model is actually running on (`"gpu"` / `"cpu"`), or nil
+    /// if nothing is loaded. Not necessarily the backend that was requested.
+    var activeBackend: String? { bridge?.activeBackend }
+
+    /// Path of the LoRA adapter actually applied, or nil when running on bare
+    /// weights. An adapter that failed to load leaves this nil while the engine
+    /// still works, so read it rather than assuming `warmUp(adapterPath:)` took.
+    var activeLoRAPath: String? { bridge?.activeLoRAPath }
+
+    init(namespace: String) {
+        self.namespace = namespace
+        self.queue = DispatchQueue(label: "com.example.slmchat.engine.\(namespace)",
+                                   qos: .userInitiated)
+    }
+
+    /// Benchmark-only load options. `forcedDecodeTokens > 0` makes llama.cpp
+    /// decode exactly that many tokens and ignore EOS; 0 leaves decoding natural
+    /// while still collecting metrics. Benchmark instrumentation is a load-time
+    /// setting, hence a distinct load rather than a per-call flag.
+    struct BenchmarkOptions {
+        let forcedDecodeTokens: Int32
+    }
+
+    /// Set llama.cpp's log verbosity (process-wide). The benchmark sweep raises
+    /// this so a failed load's real reason reaches the console.
+    static func setRuntimeLogLevel(_ level: Int32) {
+        ChatLM.setLogLevel(level)
+    }
+
+    /// Load the model once. `backend` defaults to `SLMBackend.preferred()` — Metal
+    /// unless a previous GPU load aborted (see `SLMBackend`). The benchmark
+    /// harness names a backend explicitly. `ChatLM` still forces CPU on the
+    /// simulator, which has no Metal compute device, so a `"gpu"` request there is
+    /// silently served on CPU.
+    ///
+    /// `benchmark` turns on llama.cpp's own timing; `activation` is accepted for
+    /// signature parity but ignored on llama.cpp (see `ChatLMActivationType`).
+    ///
+    /// `adapterPath` applies a LoRA language pack for the whole life of the load.
+    /// It is a LOAD parameter, not a per-call one, on purpose: adapters bind to
+    /// the llama context, so changing one mid-session would silently invalidate
+    /// every cached prompt prefix. Switching language means reloading the engine
+    /// — see `LoRACatalog` and the `loraPath:` note in ChatLM.h.
+    func warmUp(modelName: String,
+                backend: String = SLMBackend.preferred(),
+                adapterPath: String? = nil,
+                benchmark: BenchmarkOptions? = nil,
+                activation: ChatLMActivationType = .auto) async -> (ok: Bool, error: String?) {
+        guard let modelPath = ResourceLookup.path(modelName, ext: "gguf") else {
+            return (false, "\(modelName).gguf not in bundle — drop it into Resources/.")
+        }
+        // llama.cpp has no external kernel cache (LiteRT-LM used one); ChatLM
+        // ignores cacheDir, kept only for signature parity.
+        return await withCheckedContinuation { cont in
+            queue.async { [weak self] in
+                let b = ChatLM()
+                let t0 = Date()
+                let ok = SLMBackend.guardingLoad(backend: backend) {
+                    b.load(modelPath: modelPath,
+                           backend: backend,
+                           cacheDir: nil,
+                           loraPath: adapterPath,
+                           enableBenchmark: benchmark != nil,
+                           forcedDecodeTokens: benchmark?.forcedDecodeTokens ?? 0,
+                           activation: activation)
+                }
+                if Self.logPerf {
+                    // Report the adapter that was ASKED FOR alongside the one that
+                    // took: a pack that fails to parse degrades to bare weights
+                    // silently, and that difference is invisible in the output.
+                    let lora: String
+                    switch (adapterPath, b.activeLoRAPath) {
+                    case (nil, _):            lora = "none"
+                    case (_?, let got?):      lora = (got as NSString).lastPathComponent
+                    case (let want?, nil):    lora = "FAILED(\((want as NSString).lastPathComponent))"
+                    }
+                    NSLog("[SLMPerf] load %@/%@ backend=%@ (asked %@) lora=%@ → %@ in %.3fs",
+                          self?.namespace ?? "?", modelName, b.activeBackend, backend,
+                          lora, ok ? "ok" : "FAILED", -t0.timeIntervalSinceNow)
+                }
+                if ok {
+                    b.prefixReuseEnabled = self?.prefixReuseEnabled ?? true
+                    self?.bridge = b
+                    self?.loadedModelName = modelName
+                    cont.resume(returning: (true, nil))
+                } else {
+                    cont.resume(returning: (false, b.lastError))
+                }
+            }
+        }
+    }
+
+    /// Release the loaded model, freeing its memory mapping. `warmUp` keeps the
+    /// current model alive until a new one loads (so a failed switch can't kill
+    /// the features), which means both are mapped at once during a load — the
+    /// benchmark harness calls this first to measure each model's cost against a
+    /// clean baseline. Runs on the engine's queue, so in-flight work finishes.
+    func unload() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async { [weak self] in
+                self?.bridge = nil
+                cont.resume()
+            }
+        }
+    }
+
+    /// Token count of `text` under the loaded model's vocabulary, or nil when no
+    /// model is loaded.
+    ///
+    /// Deliberately synchronous and off the engine queue. Tokenizing only READS the
+    /// vocabulary — it touches neither the context nor the KV cache — so it is safe
+    /// to call concurrently with a generation, and it has to be: chunking a long
+    /// message means hundreds of these calls, and hopping the serial queue for each
+    /// would either deadlock (when called from a callback) or serialise behind an
+    /// in-flight generation.
+    func tokenCount(of text: String) -> Int? {
+        guard let bridge else { return nil }
+        return Int(bridge.tokenCount(of: text))
+    }
+
+    /// Turn KV prefix reuse on/off. Off makes every call pay a full prompt pass,
+    /// which is the only way to read a true prefill tok/s — with reuse on, the
+    /// rate is per evaluated token and a cached turn reports almost nothing.
+    ///
+    /// Applied to the live engine and remembered, so a reload (model, language or
+    /// backend switch) doesn't silently turn caching back on mid-measurement.
+    func setPrefixReuse(_ enabled: Bool) {
+        prefixReuseEnabled = enabled
+        queue.async { [weak self] in self?.bridge?.prefixReuseEnabled = enabled }
+    }
+
+    /// Remembered so `warmUp` can re-apply it to a freshly loaded bridge.
+    private(set) var prefixReuseEnabled = true
+
+    /// Load a LoRA pack into the engine ahead of the call that needs it, so the
+    /// one-off `.gguf` parse doesn't land inside a latency-budgeted generation.
+    ///
+    /// Fire-and-forget: it runs on the engine's serial queue, so it can't overlap
+    /// a generation, and if a generation gets there first that call simply pays
+    /// the cost itself — the result is identical either way, only the timing
+    /// differs. Nothing depends on this having completed.
+    func prewarmAdapter(path: String?) {
+        guard let path else { return }
+        queue.async { [weak self] in self?.bridge?.prewarmAdapter(path: path) }
+    }
+
+    /// Evaluate the stable prefix of `user` into a cacheable slot without
+    /// generating — see `ChatLM.prefill`. Serialized like every other call, so a
+    /// generation queued behind it always sees the finished prefix. Returns the
+    /// pass's metrics (`promptTokenCount` = tokens now cached), or nil if it did
+    /// nothing.
+    func prefill(user: String,
+                 label: SLMFeatureLabel = .suggestPrewarm,
+                 adapterPath: String? = nil) async -> ChatLMTurnMetrics? {
+        await withCheckedContinuation { cont in
+            queue.async { [weak self] in
+                guard let self, let bridge = self.bridge else {
+                    cont.resume(returning: nil); return
+                }
+                let queued = Date()
+                let n = bridge.prefill(system: nil, history: [], user: user,
+                                       adapterPath: adapterPath)
+                guard n > 0 else { cont.resume(returning: nil); return }
+                self.logPerf(label: label.description, bridge: bridge,
+                             callSeconds: -queued.timeIntervalSinceNow,
+                             maxTokens: 0, temperature: 0)
+                cont.resume(returning: bridge.lastTurnMetrics)
+            }
+        }
+    }
+
+    /// Blocking generation, serialized and off-main. Returns the trimmed reply.
+    ///
+    /// `label` names the feature this call serves and only tags the
+    /// `[SLMPerf]` line / decides cacheability (see `SLMFeatureLabel`); it has
+    /// no other effect on generation.
+    func complete(system: String?,
+                  history: [Turn],
+                  user: String,
+                  maxTokens: Int32,
+                  temperature: Float,
+                  label: SLMFeatureLabel = .complete,
+                  adapterPath: String? = nil) async -> String? {
+        await completeMeasured(system: system, history: history, user: user,
+                               maxTokens: maxTokens, temperature: temperature,
+                               label: label, adapterPath: adapterPath).text
+    }
+
+    /// `complete`, plus the turn's metrics read on the engine queue — the only
+    /// place they can't be overwritten by the next call before the caller looks.
+    func completeMeasured(system: String?,
+                          history: [Turn],
+                          user: String,
+                          maxTokens: Int32,
+                          temperature: Float,
+                          label: SLMFeatureLabel = .complete,
+                          adapterPath: String? = nil) async -> (text: String?, metrics: ChatLMTurnMetrics?) {
+        await withCheckedContinuation { cont in
+            queue.async { [weak self] in
+                guard let self, let bridge = self.bridge else {
+                    cont.resume(returning: (nil, nil)); return
+                }
+                let queued = Date()
+                let out = bridge.generate(system: system,
+                                          history: history,
+                                          user: user,
+                                          maxTokens: maxTokens,
+                                          temperature: temperature,
+                                          cacheable: label.isCacheable,
+                                          adapterPath: adapterPath)
+                self.logPerf(label: label.description, bridge: bridge,
+                             callSeconds: -queued.timeIntervalSinceNow,
+                             maxTokens: maxTokens, temperature: temperature)
+                if out == nil { NSLog("[SLMEngine] generate → nil, lastError=%@", bridge.lastError) }
+                cont.resume(returning:
+                    (out?.trimmingCharacters(in: .whitespacesAndNewlines), bridge.lastTurnMetrics))
+            }
+        }
+    }
+
+    /// Streamed generation for the chatbot's typing effect. `onChunk` fires per
+    /// token on the engine's thread (NOT main) — marshal to main before touching
+    /// UI. Returns only when generation completes.
+    func stream(system: String?,
+                history: [Turn],
+                user: String,
+                maxTokens: Int32,
+                temperature: Float,
+                label: SLMFeatureLabel = .stream,
+                onChunk: @escaping (_ chunk: String, _ done: Bool) -> Void) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async { [weak self] in
+                guard let self, let bridge = self.bridge else {
+                    onChunk("", true); cont.resume(); return
+                }
+                let queued = Date()
+                bridge.stream(system: system,
+                              history: history,
+                              user: user,
+                              maxTokens: maxTokens,
+                              temperature: temperature,
+                              cacheable: label.isCacheable,
+                              onChunk: onChunk)
+                self.logPerf(label: label.description, bridge: bridge,
+                             callSeconds: -queued.timeIntervalSinceNow,
+                             maxTokens: maxTokens, temperature: temperature)
+                cont.resume()
+            }
+        }
+    }
+
+    /// Streamed generation that also returns llama.cpp's own metrics for the turn
+    /// — exact token counts and a wall-clock TTFT measured inside the bridge,
+    /// rather than inferred from callback timing. Requires a `warmUp(benchmark:)`
+    /// load; returns nil otherwise.
+    func streamMeasured(system: String?,
+                        history: [Turn],
+                        user: String,
+                        maxTokens: Int32,
+                        temperature: Float,
+                        onChunk: @escaping (_ chunk: String, _ done: Bool) -> Void)
+        async -> ChatLMBenchmarkInfo? {
+        await withCheckedContinuation { cont in
+            queue.async { [weak self] in
+                guard let bridge = self?.bridge else {
+                    onChunk("", true); cont.resume(returning: nil); return
+                }
+                let info = bridge.benchmarkStream(system: system,
+                                                  history: history,
+                                                  user: user,
+                                                  maxTokens: maxTokens,
+                                                  temperature: temperature,
+                                                  onChunk: onChunk)
+                if info == nil {
+                    NSLog("[SLMEngine] benchmarkStream → nil, lastError=%@", bridge.lastError)
+                }
+                cont.resume(returning: info)
+            }
+        }
+    }
+
+    // MARK: - Perf logging
+
+    /// Emit one `[SLMPerf]` line for the generation that just finished on
+    /// `bridge`, e.g.
+    ///
+    /// ```
+    /// [SLMPerf] task/suggest-gemma3 | in=412 tok | prefill 0.884s (466.1 tok/s) |
+    /// ttft 0.951s | out=57 tok (188 chars) | decode 1.702s (33.5 tok/s) |
+    /// overhead 0.041s | TOTAL 2.627s | stop=eos | cap=160 temp=0.80
+    /// ```
+    ///
+    /// `callSeconds` is measured in Swift and includes the bridge call itself, so
+    /// it should track `TOTAL` closely — a gap means time went to the `onChunk`
+    /// consumer. Queue wait (another feature generating first) is NOT in either
+    /// number; measure that at the feature level with `SLMTurnTimer`.
+    private func logPerf(label: String, bridge: ChatLM, callSeconds: Double,
+                         maxTokens: Int32, temperature: Float) {
+        guard Self.logPerf else { return }
+        guard let m = bridge.lastTurnMetrics else {
+            NSLog("[SLMPerf] %@/%@ %@ | no metrics (call %.3fs) err=%@",
+                  namespace, label, loadedModelName, callSeconds, bridge.lastError)
+            return
+        }
+        NSLog("[SLMPerf] %@/%@ %@(%@) | %@ | cap=%d temp=%.2f%@",
+              namespace, label, loadedModelName, bridge.activeBackend,
+              m.summaryLine, maxTokens, temperature,
+              callSeconds - m.totalSeconds > 0.05
+                  ? String(format: " | callback +%.3fs", callSeconds - m.totalSeconds) : "")
+    }
+}
+
+/// Stopwatch for one user-visible turn — the number a latency budget is written
+/// against (e.g. "auto-suggest must land under 3s"). A turn can span several
+/// model calls (retries, map-reduce chunks) plus parsing and any queue wait
+/// behind another feature, none of which a single `[SLMPerf]` generation line
+/// shows.
+///
+/// ```swift
+/// let turn = SLMTurnTimer("auto-suggest")
+/// …
+/// turn.finish("attempts=\(n) chips=\(suggestions.count)")
+/// ```
+struct SLMTurnTimer {
+    private let label: String
+    private let start = Date()
+    /// Extra latency the user already waited before the turn began (e.g. the
+    /// auto-suggest debounce), reported alongside so the end-to-end wait is
+    /// visible next to the model's share of it.
+    private let preDelay: Double
+
+    init(_ label: String, preDelay: Double = 0) {
+        self.label = label
+        self.preDelay = preDelay
+    }
+
+    var elapsed: Double { -start.timeIntervalSinceNow }
+
+    /// Log the turn's total. `budget` flags the line with OVER/ok so a regression
+    /// is visible without doing arithmetic in the console.
+    func finish(_ detail: String = "", budget: Double = 3.0) {
+        guard SLMEngine.logPerf else { return }
+        let t = elapsed
+        let e2e = t + preDelay
+        NSLog("[SLMPerf] TURN %@ | model %.3fs%@ | e2e %.3fs | %@ (budget %.1fs) %@",
+              label, t,
+              preDelay > 0 ? String(format: " + wait %.3fs", preDelay) : "",
+              e2e, e2e <= budget ? "ok" : "OVER", budget, detail)
+    }
+}

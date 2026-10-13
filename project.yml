@@ -1,0 +1,88 @@
+name: SLMChatMac
+options:
+  bundleIdPrefix: com.example.slmchat
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    # Apple Silicon only: llama.xcframework ships macos-arm64, and the TFLite
+    # dylib is built for arm64 (scripts/build_tflite_macos.sh).
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    # ChatLM.mm / GuardLM.mm / ImageTagLM.mm are Obj-C++ over the llama.cpp and
+    # TFLite C APIs.
+    CLANG_CXX_LANGUAGE_STANDARD: "c++17"
+    CLANG_CXX_LIBRARY: "libc++"
+
+targets:
+  # Same parity fixtures as the iOS app — the reference output of the original
+  # Hugging Face tokenizer and BERT-Tiny model. Keep them green: a drift here
+  # misclassifies text without failing anything else.
+  GuardrailTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: GuardrailTests
+    dependencies:
+      - target: SLMChat
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.slmchat.mac.GuardrailTests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/SLMChat.app/Contents/MacOS/SLMChat"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        GENERATE_INFOPLIST_FILE: YES
+
+  SLMChat:
+    type: application
+    platform: macOS
+    scheme:
+      testTargets:
+        - GuardrailTests
+    sources:
+      - path: SLMChat
+        excludes:
+          - Info.plist
+      # Plain group, not a folder reference (same reason as iOS: every file
+      # must be enumerated). Populated by scripts/bootstrap.sh.
+      - path: Resources
+        optional: true
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.slmchat.mac
+        PRODUCT_NAME: SLMChat
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_FILE: SLMChat/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"
+        # Demo build: no sandbox, so the app can reach the chat API and read
+        # models without entitlements. Revisit for distribution.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_OBJC_BRIDGING_HEADER: SLMChat/SLMChat-Bridging-Header.h
+        OTHER_LDFLAGS:
+          - -lc++
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - "$(PROJECT_DIR)/Frameworks/tflite"
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../Frameworks"
+    dependencies:
+      # llama.cpp + Metal; ChatLM.mm imports <llama/llama.h>.
+      - framework: Frameworks/llama.xcframework
+        embed: true
+        sign: true
+      # TFLite C API for GuardLM / ImageTagLM (prototypes in TFLiteC.h).
+      - framework: Frameworks/tflite/libtensorflowlite_c.dylib
+        embed: true
+        sign: true

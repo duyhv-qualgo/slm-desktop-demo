@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copy this to Resources/APIConfig.plist and fill in your values, then re-run
+  `xcodegen generate` (so the new resource is bundled) and rebuild.
+
+  When Resources/APIConfig.plist is present, Alex's chat replies come from this
+  API and the on-device chat model is NOT loaded. The 3 features (translate /
+  auto-reply / summarize) always stay on the on-device task model.
+
+  Resources/APIConfig.plist is gitignored — the key never lands in git.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>baseURL</key>
+	<string>https://YOUR-PROXY/v1/chat/completions</string>
+	<key>apiKey</key>
+	<string>sk-REPLACE_ME</string>
+	<key>model</key>
+	<string>openai/gpt-5.5</string>
+</dict>
+</plist>

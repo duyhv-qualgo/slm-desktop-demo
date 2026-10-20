@@ -509,6 +509,7 @@ final class Conversation: ObservableObject, Identifiable {
                 // Reuse switched off (Settings → Diagnostics) discards every
                 // slot on purpose; say so rather than blaming eviction.
                 let why = !service.prefixReuseEnabled ? "reuse-off"
+                    : !service.prefixReuseActive ? "model-off"
                     : pw.windowStart != start ? "window-moved"
                     : pw.language != language ? "language-changed"
                     : pw.adapter != adapter ? "pack-changed"
@@ -551,9 +552,10 @@ final class Conversation: ObservableObject, Identifiable {
     /// the suggest is possible: both run on the engine's serial queue, so a
     /// suggest that arrives early waits for the prefill and then reuses it.
     private func prewarmNextSuggest() {
-        // With prefix reuse off the suggest throws the slot away anyway, so a
-        // pre-warm would be pure wasted prefill.
-        guard service.autoSuggestEnabled, service.prefixReuseEnabled, isActive else { return }
+        // With prefix reuse off — by setting, or for a model it's off for
+        // (ChatService.prefixReuseActive) — the suggest throws the slot away
+        // anyway, so a pre-warm would be pure wasted prefill.
+        guard service.autoSuggestEnabled, service.prefixReuseActive, isActive else { return }
         let language = Prompts.conversationLanguage(messages, native: service.nativeLanguage)
         let adapter: String?
         switch service.suggestAdapter(for: language) {

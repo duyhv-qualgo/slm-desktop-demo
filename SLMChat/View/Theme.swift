@@ -204,24 +204,6 @@ extension View {
     }
 }
 
-/// Pill-shaped suggestion chip.
-struct SuggestionChip: View {
-    let text: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Text(text)
-                .font(.system(size: 13))
-                .lineLimit(1)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .overlay(Capsule().stroke(Theme.accent.opacity(0.6)))
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 extension View {
     /// Header-sized icon for a plain `Button` whose label switches to a spinner.
     func headerButtonStyle() -> some View {

@@ -7,8 +7,9 @@ options:
   groupSortPosition: top
 
 packages:
-  # On-device text embeddings (EmbeddingGemma 2) for semantic message search.
-  # Ships its own prebuilt macOS dylib; see SLMChat/Engine/TextEmbedder.swift.
+  # LiteRT-LM: text + photo embeddings (EmbeddingGemma 2) for semantic search,
+  # and the TFLite runtime for the guardrail / tagger. Xcode downloads its
+  # prebuilt macOS dylib; see SLMChat/Engine/MessageEmbedder.swift.
   LiteRTLM:
     url: https://github.com/google-ai-edge/LiteRT-LM.git
     exactVersion: 0.18.0
@@ -17,13 +18,12 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    # Apple Silicon only: llama.xcframework ships macos-arm64, and the TFLite
-    # dylib is built for arm64 (scripts/build_tflite_macos.sh).
+    # Apple Silicon only: llama.xcframework ships macos-arm64.
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     # ChatLM.mm / GuardLM.mm / ImageTagLM.mm are Obj-C++ over the llama.cpp and
-    # TFLite C APIs.
+    # TFLite C APIs (the latter re-exported by LiteRT-LM, see TFLiteC.h).
     CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     CLANG_CXX_LIBRARY: "libc++"
 
@@ -78,9 +78,6 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: SLMChat/SLMChat-Bridging-Header.h
         OTHER_LDFLAGS:
           - -lc++
-        LIBRARY_SEARCH_PATHS:
-          - $(inherited)
-          - "$(PROJECT_DIR)/Frameworks/tflite"
         LD_RUNPATH_SEARCH_PATHS:
           - $(inherited)
           - "@executable_path/../Frameworks"
@@ -89,9 +86,9 @@ targets:
       - framework: Frameworks/llama.xcframework
         embed: true
         sign: true
-      # TFLite C API for GuardLM / ImageTagLM (prototypes in TFLiteC.h).
-      - framework: Frameworks/tflite/libtensorflowlite_c.dylib
-        embed: true
-        sign: true
+      # LiteRT-LM: the embedder (MessageEmbedder) AND, as on iOS, the TFLite
+      # runtime for GuardLM / ImageTagLM — its dylib statically bundles TFLite
+      # and re-exports the classic C API (prototypes in TFLiteC.h). Bumping
+      # this version changes the guardrail's TFLite: re-run the parity tests.
       - package: LiteRTLM
         product: LiteRTLM

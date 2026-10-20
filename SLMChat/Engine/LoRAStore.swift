@@ -36,7 +36,7 @@ final class LoRAStore: ObservableObject {
     /// Re-derive install state from disk. Cheap (a few `fileExists` calls), so
     /// it's safe to call whenever Settings appears.
     func refresh() {
-        for adapter in LoRACatalog.adapters {
+        for adapter in LoRACatalog.allAdapters {
             // Don't stomp a download in flight with a disk check that is, by
             // definition, about to be out of date.
             if case .downloading = states[adapter.id] { continue }

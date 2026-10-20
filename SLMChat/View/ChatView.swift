@@ -27,6 +27,11 @@ struct ChatView: View {
 
     /// The message currently flashed after a search jump.
     @State private var flashID: UUID?
+    /// Bubbles currently on screen, for read receipts. A plain reference, not
+    /// observed: rows scrolling in and out must not re-render the whole view.
+    @State private var onScreen = OnScreenMessages()
+    /// Key / active / inactive window. Nothing counts as seen while inactive.
+    @Environment(\.controlActiveState) private var windowState
     /// The contact-info panel on the right (the design's split-view toggle).
     @State private var showInfo = false
     /// A file is being dragged over the thread.
@@ -59,9 +64,14 @@ struct ChatView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: conversation.isComposeOpen)
+        .animation(.easeOut(duration: 0.2), value: conversation.suggestions)
+        .animation(.easeOut(duration: 0.2), value: conversation.isSuggesting)
         .animation(.easeInOut(duration: 0.2), value: showInfo)
         .onAppear {
             conversation.isActive = true
+            // The input box starts empty on every visit (its text is view-local),
+            // so a draft flag left from the last visit would block suggestions.
+            conversation.isDrafting = false
             // Opening a chat that's already waiting on your reply → offer suggestions.
             conversation.scheduleAutoSuggest()
         }
@@ -135,6 +145,28 @@ struct ChatView: View {
 
     // MARK: - Message list
 
+    /// Mark the friend messages on screen as read once they've stayed there a
+    /// moment — scrolling past doesn't count — and only while this window is
+    /// in front. Coalesced: many rows appearing at once make one pass.
+    private func scheduleSeenPass() {
+        onScreen.pending?.cancel()
+        onScreen.pending = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, windowState != .inactive, conversation.isActive else { return }
+            let ids = onScreen.ids
+            conversation.markSeen(conversation.messages.filter { ids.contains($0.id) })
+        }
+    }
+
+    /// Scroll to the newest message once the layout has settled.
+    private func pinToLatest(_ proxy: ScrollViewProxy) {
+        guard flashID == nil, let last = conversation.messages.last?.id else { return }
+        // After the tray's 0.2 s height animation, so we land on the final layout.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(last, anchor: .bottom) }
+        }
+    }
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -160,7 +192,12 @@ struct ChatView: View {
                         // gets it classified — the row asks as it materializes,
                         // and screens a little ahead of itself. A no-op for
                         // anything already screened, which is the common case.
-                        .onAppear { conversation.screenFromViewport(message) }
+                        .onAppear {
+                            conversation.screenFromViewport(message)
+                            onScreen.ids.insert(message.id)
+                            scheduleSeenPass()
+                        }
+                        .onDisappear { onScreen.ids.remove(message.id) }
                     }
                     if conversation.isBotTyping {
                         typingIndicator
@@ -199,6 +236,17 @@ struct ChatView: View {
                     }
                 }
             }
+            // The suggestion tray takes height from the thread as it appears
+            // (and again when its chips replace the loading row). Re-pin the
+            // bottom so the message being replied to stays in view. Skipped
+            // while a search jump is flashing, which put the reader elsewhere.
+            .onChange(of: conversation.suggestions) { _ in pinToLatest(proxy) }
+            .onChange(of: conversation.isSuggesting) { _ in pinToLatest(proxy) }
+            // Read receipts: a reply that lands while you're watching, or
+            // coming back to the window, counts what's on screen as seen.
+            .onChange(of: conversation.isBotTyping) { typing in if !typing { scheduleSeenPass() } }
+            .onChange(of: conversation.messages.count) { _ in scheduleSeenPass() }
+            .onChange(of: windowState) { _ in scheduleSeenPass() }
             .onChange(of: jump) { request in
                 _ = SearchJump.perform(request, in: conversation.messages.map(\.id),
                                        proxy: proxy, flash: $flashID)
@@ -354,29 +402,22 @@ struct ChatView: View {
 
     @ViewBuilder
     private var suggestionRow: some View {
-        if conversation.isSuggesting {
+        // Only while nobody is typing: not the contact (a new message is on
+        // its way, so the chips would answer the wrong one) and not you (you've
+        // started your own reply). Clearing the draft brings them back.
+        if !conversation.isBotTyping, !conversation.isDrafting, conversation.input.isEmpty,
+           conversation.isSuggesting || !conversation.suggestions.isEmpty {
             // Auto-suggest is the only feature that starts without the user
-            // asking, so this is the one place it can say it's working. It used
-            // to be the spinner inside the input bar's suggest button; that
-            // button is gone, and a silent 3 s gap before chips appear reads as
-            // nothing happening.
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Suggesting replies\u{2026}")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal).padding(.vertical, 8)
-        } else if !conversation.suggestions.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(conversation.suggestions, id: \.self) { s in
-                        SuggestionChip(text: s) { conversation.useSuggestion(s) }
-                    }
-                }
-                .padding(.horizontal, 24).padding(.vertical, 8)
-            }
+            // asking, so the tray's loading state is the one place it can say
+            // it's working — a silent 3 s gap before chips reads as nothing
+            // happening.
+            SuggestionTray(suggestions: conversation.suggestions,
+                           isLoading: conversation.isSuggesting,
+                           canRefresh: isReady && !conversation.isBusy,
+                           onUse: { conversation.useSuggestion($0) },
+                           onSend: { conversation.send($0) },
+                           onRefresh: { Task { await conversation.suggest() } },
+                           onDismiss: { conversation.suggestions = [] })
         } else if let notice = conversation.notice {
             // Neutral note (e.g. the smart-reply model declined to suggest).
             HStack(spacing: 6) {
@@ -555,6 +596,13 @@ private struct InputBar: View {
                     await MainActor.run { photoItem = nil; text = "" }
                 }
             }
+            // Tell the thread when a draft starts or ends — not every keystroke.
+            // Starting one cancels a pending auto-suggest and hides the chips;
+            // clearing it lets suggestions come back.
+            .onChange(of: text.isEmpty) { empty in
+                conversation.isDrafting = !empty
+                if empty { conversation.scheduleAutoSuggest() } else { conversation.cancelAutoSuggest() }
+            }
             .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item]) { result in
                 guard case .success(let url) = result else { return }
                 let scoped = url.startAccessingSecurityScopedResource()
@@ -652,4 +700,11 @@ private struct InputBar: View {
             text = conversation.input
         }
     }
+}
+
+/// Which message rows are on screen right now. A class so updating it from
+/// row `onAppear`/`onDisappear` doesn't invalidate `ChatView`.
+private final class OnScreenMessages {
+    var ids = Set<UUID>()
+    var pending: Task<Void, Never>?
 }

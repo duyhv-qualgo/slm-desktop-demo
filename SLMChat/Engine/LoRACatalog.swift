@@ -353,16 +353,21 @@ enum LoRACatalog {
                     simulatedDownload: true),
     ]
 
+    /// `adapters` plus the desktop app's packs for its evaluation models, which
+    /// the iOS catalog doesn't have (`DesktopModels.evaluationAdapters`). Every
+    /// lookup goes through this, so `adapters` itself stays identical to iOS.
+    static var allAdapters: [LoRAAdapter] { adapters + DesktopModels.evaluationAdapters }
+
     /// The pack serving this (model, language) pair, or nil to run on bare
     /// weights.
     static func adapter(baseModelID: String, language: TranslateLanguage) -> LoRAAdapter? {
-        adapters.first { $0.baseModelID == baseModelID && $0.languages.contains(language) }
+        allAdapters.first { $0.baseModelID == baseModelID && $0.languages.contains(language) }
     }
 
     /// Packs for one base model, in catalog order — what Settings lists once a
     /// model is selected.
     static func adapters(forBaseModel id: String) -> [LoRAAdapter] {
-        adapters.filter { $0.baseModelID == id }
+        allAdapters.filter { $0.baseModelID == id }
     }
 
     // MARK: - Locations

@@ -30,10 +30,26 @@ final class Conversation: ObservableObject, Identifiable {
 
     @Published var messages: [ChatMessage]
     @Published var input: String = ""
+    /// The input box holds a draft. The field keeps its text locally (see
+    /// `InputBar`), so `input` stays empty while the user types; this flag is
+    /// what tells the rest of the thread. Flips only on empty ↔ non-empty, never
+    /// per keystroke, so it doesn't bring back the re-render cost `InputBar`
+    /// avoids.
+    @Published var isDrafting = false
     /// Ticks on every programmatic write to `input` via `setInput`. See there.
     @Published private(set) var inputRevision = 0
 
-    @Published var isBotTyping: Bool = false
+    /// The contact is typing. Suggestions answer the message before it, so
+    /// they're withdrawn the moment a new one starts: a pending auto-suggest is
+    /// cancelled and shown chips are cleared, which also lets the next
+    /// auto-suggest (gated on `suggestions.isEmpty`) run for the new message.
+    @Published var isBotTyping: Bool = false {
+        didSet {
+            guard isBotTyping, !oldValue else { return }
+            cancelAutoSuggest()
+            suggestions = []
+        }
+    }
     @Published var isSuggesting: Bool = false
     @Published var isSummarizing: Bool = false
 
@@ -647,7 +663,7 @@ final class Conversation: ObservableObject, Identifiable {
         // `!isComposeOpen`: the compose bar is already proposing text for this
         // input box, and chips popping up underneath it are a second, competing
         // answer to the question the user is mid-way through answering.
-        guard service.autoSuggestEnabled, isActive, input.isEmpty, !isBusy,
+        guard service.autoSuggestEnabled, isActive, input.isEmpty, !isDrafting, !isBusy,
               !isComposeOpen, suggestions.isEmpty, unrepliedCount > 0,
               let last = messages.last(where: { !$0.text.isEmpty }),
               last.sender == .friend, last.id != lastAutoSuggestedID else { return }
@@ -687,7 +703,7 @@ final class Conversation: ObservableObject, Identifiable {
             try? await Task.sleep(nanoseconds: UInt64(debounce * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
             // Re-check the guards — state may have moved during the debounce.
-            guard self.service.autoSuggestEnabled, self.isActive, self.input.isEmpty,
+            guard self.service.autoSuggestEnabled, self.isActive, self.input.isEmpty, !self.isDrafting,
                   !self.isBusy, !self.isComposeOpen, self.suggestions.isEmpty,
                   self.messages.last(where: { !$0.text.isEmpty })?.id == targetID else { return }
             self.lastAutoSuggestedID = targetID
@@ -1305,6 +1321,24 @@ final class Conversation: ObservableObject, Identifiable {
             changed = true
         }
         if changed { persist() }
+    }
+
+    /// Mark these friend messages read because the user has actually seen them
+    /// (on screen, app in front — decided by `ChatView`). Only the read flag:
+    /// the catch-up banner and summary count *unreplied* messages, so seeing a
+    /// backlog doesn't take away the offer to summarize it.
+    func markSeen(_ seen: [ChatMessage]) {
+        var changed = false
+        for m in seen where m.sender == .friend && !m.isRead && !m.text.isEmpty {
+            m.isRead = true
+            changed = true
+        }
+        if changed {
+            // Flipping a child message in place doesn't fire ours; the inbox
+            // badge observes the conversation.
+            objectWillChange.send()
+            persist()
+        }
     }
 
     /// Mark the conversation unread from the inbox. Flips the friend messages since

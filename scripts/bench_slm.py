@@ -211,11 +211,13 @@ def rss_mb(pid):
     out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
     return int(out.strip() or 0) / 1024
 
-def pack_language(task, lang, native):
+def pack_language(task, lang, native, packs):
     """The LoRA pack ChatService runs this task under: suggestions and compose
     follow the conversation (`suggestAdapter`), everything else runs on the
-    native-language pack the engine was loaded with."""
-    return lang if task in ("suggest", "compose") else native
+    native-language pack the engine was loaded with — which is also what a
+    conversation language with no published pack falls back to."""
+    want = lang if task in ("suggest", "compose") else native
+    return want if want in packs else native
 
 def main():
     ap = argparse.ArgumentParser()
@@ -268,7 +270,7 @@ def main():
                 body = dict(messages=msgs, top_k=20, top_p=0.95, cache_prompt=False,
                             chat_template_kwargs={"enable_thinking": False}, **PARAMS[task])
                 if packs:
-                    want = pack_language(task, lang, a.native)
+                    want = pack_language(task, lang, a.native, packs)
                     body["lora"] = [{"id": i, "scale": 1.0 if l == want else 0.0}
                                     for i, l in enumerate(packs)]
                 t = time.time()

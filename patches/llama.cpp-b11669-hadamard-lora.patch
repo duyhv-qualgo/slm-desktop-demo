@@ -1,0 +1,50 @@
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 6a7ffd6..c456846 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -334,9 +334,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
+         if (!model_tensor) {
+             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
+         }
+-        // the LoRA delta of a Hadamard-folded weight reads the transformed input, so the result is wrong
+-        if (model.hdmd.weight_blocks.count(name) || model.hdmd.inverse_blocks.count(name)) {
+-            throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard folded weight, which is not supported");
++        // build_lora_mm feeds a folded weight's LoRA delta the primal input, so folded matmul weights are fine;
++        // a latent lookup table (token_embd, also the head when the output is tied) stores rotated rows, refuse it
++        if (model.hdmd.inverse_blocks.count(name)) {
++            throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard latent lookup table, which is not supported");
+         }
+ 
+         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6cadda9..0a4532a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1616,8 +1616,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    cur = build_hadamard_input(w, cur);
+-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
++    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
++    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);
+@@ -1658,11 +1659,12 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * ids,
+           ggml_tensor * w_s,
+           ggml_tensor * slots) const {
+-    cur = build_hadamard_input(w, cur);
++    // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
++    ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = slots == nullptr ?
+-        ggml_mul_mat_id(ctx0, w, cur, ids) :
+-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
++        ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
++        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);

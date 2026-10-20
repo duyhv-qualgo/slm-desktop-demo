@@ -80,8 +80,11 @@ fi
 [[ -e "$IOS/Resources/APIConfig.plist" ]] && clone Resources/APIConfig.plist Resources \
   || echo "note: no APIConfig.plist — the chat partner will be mute (see APIConfig.example.plist)"
 
-# --- llama.cpp (already ships a macos-arm64 slice) ---------------------------
-clone Frameworks/llama.xcframework Frameworks
+# --- llama.cpp: built here, NOT taken from iOS -------------------------------
+# Official llama.cpp at a pinned tag + patches/ (Bonsai 2 needs b11556+ and the
+# Hadamard LoRA patch); iOS keeps its own older build. See build_llama_macos.sh.
+[[ -e Frameworks/llama.xcframework ]] || ./scripts/build_llama_macos.sh \
+  || missing+=("Frameworks/llama.xcframework (scripts/build_llama_macos.sh failed)")
 
 # --- TFLite C library (built locally) -----------------------------------------
 [[ -e Frameworks/tflite/libtensorflowlite_c.dylib ]] \

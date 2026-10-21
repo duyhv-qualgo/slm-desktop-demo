@@ -116,8 +116,12 @@ final class TurnMetricsTests: XCTestCase {
 /// Exists to A/B a single engine setting: whether the BLAS (Accelerate) device is
 /// left in the CPU device list. It reports the ratio rather than raw tok/s,
 /// because the absolute numbers are simulator numbers and don't transfer to a
-/// phone — but "is prefill actually batched?" does.
+/// phone — but "is prefill actually batched?" does. Also the before/after check
+/// for a rebuilt llama.xcframework; `TEST_RUNNER_PROBE_BACKEND=gpu` runs it on Metal.
 final class PrefillThroughputProbe: XCTestCase {
+
+    private let backend =
+        ProcessInfo.processInfo.environment["PROBE_BACKEND"] == "gpu" ? SLMBackend.gpu : SLMBackend.cpu
 
     /// Long enough that the prompt pass dominates and a per-token fallback path is
     /// obvious. ~350+ tokens, comfortably inside the 1024-token per-slot budget.
@@ -143,17 +147,19 @@ final class PrefillThroughputProbe: XCTestCase {
             for adapter in [nil, pack] {
                 if adapter == nil && pack != nil { } // measure bare first, then adapted
                 let lm = ChatLM()
-                guard lm.load(modelPath: path, backend: SLMBackend.cpu,
+                guard lm.load(modelPath: path, backend: backend,
                               cacheDir: nil, loraPath: adapter) else { continue }
-                _ = lm.generate(system: nil, history: [], user: prompt,
-                                maxTokens: 24, temperature: 0.1,
-                                cacheable: false, adapterPath: nil)
+                // Greedy, so the printed reply doubles as an output-parity check.
+                let reply = lm.generate(system: nil, history: [], user: prompt,
+                                        maxTokens: 24, temperature: 0,
+                                        cacheable: false, adapterPath: nil) ?? ""
                 guard let m = lm.lastTurnMetrics else { continue }
                 let ratio = m.decodeTokensPerSecond > 0
                     ? m.prefillTokensPerSecond / m.decodeTokensPerSecond : 0
-                print(String(format: "PROBE %@ lora=%@ prefill=%.1f decode=%.1f RATIO=%.2fx",
-                             option.id, adapter == nil ? "no" : "yes",
-                             m.prefillTokensPerSecond, m.decodeTokensPerSecond, ratio))
+                print(String(format: "PROBE %@ %@ lora=%@ prefill=%.1f decode=%.1f RATIO=%.2fx reply=%@",
+                             option.id, backend == SLMBackend.gpu ? "gpu" : "cpu", adapter == nil ? "no" : "yes",
+                             m.prefillTokensPerSecond, m.decodeTokensPerSecond, ratio,
+                             reply.replacingOccurrences(of: "\n", with: " ")))
             }
         }
     }

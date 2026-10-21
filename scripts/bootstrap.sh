@@ -13,6 +13,8 @@
 #
 #  The TFLite runtime for the guardrail / image tagger comes from the LiteRT-LM
 #  Swift package (resolved by Xcode), as on iOS — nothing to build here.
+#  llama.xcframework is built from source by scripts/build_llama_xcframework.sh
+#  (first run only; ~1 min).
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -80,8 +82,9 @@ fi
 [[ -e "$IOS/Resources/APIConfig.plist" ]] && clone Resources/APIConfig.plist Resources \
   || echo "note: no APIConfig.plist — the chat partner will be mute (see APIConfig.example.plist)"
 
-# --- llama.cpp (already ships a macos-arm64 slice) ---------------------------
-clone Frameworks/llama.xcframework Frameworks
+# --- llama.cpp: built from the pinned commit, not copied from iOS -------------
+[[ -e Frameworks/llama.xcframework ]] || scripts/build_llama_xcframework.sh \
+  || missing+=("Frameworks/llama.xcframework (scripts/build_llama_xcframework.sh failed)")
 
 if (( ${#missing[@]} )); then
   echo "ERROR: missing:"; printf '  %s\n' "${missing[@]}"; exit 1

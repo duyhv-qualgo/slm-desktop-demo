@@ -12,14 +12,19 @@ which files are coupled to the trained weights. That applies unchanged here.
 ## Build & run
 
 ```bash
-brew install xcodegen                   # once
-./scripts/bootstrap.sh                  # clones models + llama.xcframework from ../demo, runs xcodegen
+brew install xcodegen cmake             # once
+./scripts/bootstrap.sh                  # clones models from ../demo, builds llama.xcframework, runs xcodegen
 open SLMChatMac.xcodeproj               # scheme SLMChat, run on "My Mac"
 ```
 
 `bootstrap.sh` takes assets from the iOS checkout (`SLMCHAT_IOS_ROOT`, default
 `../demo`) using APFS clones, so they take no extra disk space and the iOS tree is
 never written. It lists anything missing and exits non-zero.
+
+`llama.xcframework` is built from source by `scripts/build_llama_xcframework.sh`:
+llama.cpp at a pinned release tag (b9721, what the iOS framework was built from) plus any
+`scripts/llama-patches/*.patch`, arm64 only. Re-run it to rebuild; pass `ios` to
+add iPhone + simulator slices, or `LLAMA_COMMIT=<sha>` to try another llama.cpp.
 
 `SLMChatMac.xcodeproj` is generated; `project.yml` is the source of truth.
 

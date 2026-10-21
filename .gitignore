@@ -6,8 +6,9 @@ DerivedData/
 .DS_Store
 __pycache__/
 
-# Binaries — supplied by scripts/bootstrap.sh (cloned from the iOS demo, plus
-# the embedding model from Hugging Face). Never commit models or frameworks.
+# Binaries — supplied by scripts/bootstrap.sh (models cloned from the iOS demo,
+# the embedding model from Hugging Face, llama.xcframework built by
+# scripts/build_llama_xcframework.sh). Never commit models or frameworks.
 Frameworks/
 Resources/
 

@@ -54,9 +54,21 @@ actor MessageEmbedder {
         }
         let e = EmbeddingEngine(config: EmbeddingEngineConfig(
             modelPath: path, backend: .cpu(), visionBackend: .cpu(),
-            maxInputLength: Self.maxInputLength))
+            cacheDir: Self.cacheDirectory(), maxInputLength: Self.maxInputLength))
         try await e.initialize()
         engine = e
+    }
+
+    /// Where XNNPACK keeps its prepacked weights (~one file per encoder). By
+    /// default LiteRT-LM writes them next to the model — inside the app bundle,
+    /// which breaks its code signature and is read-only once installed.
+    /// Caches is right: the files are derived and rebuilt if deleted.
+    private static func cacheDirectory() -> String? {
+        guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        else { return nil }
+        let dir = base.appendingPathComponent("SLMChat/litert", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.path
     }
 
     func unload() async {

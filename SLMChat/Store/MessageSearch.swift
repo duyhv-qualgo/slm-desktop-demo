@@ -89,6 +89,10 @@ final class MessageSearch: ObservableObject {
     /// Call after the chat model has warmed up, so this never delays it.
     func start() async {
         guard !isAvailable else { return }
+        #if DEBUG
+        // Dev aid for memory comparisons: SLMCHAT_NO_SEARCH=1 skips the embedder.
+        if ProcessInfo.processInfo.environment["SLMCHAT_NO_SEARCH"] != nil { return }
+        #endif
         do {
             try await embedder.load()
         } catch {

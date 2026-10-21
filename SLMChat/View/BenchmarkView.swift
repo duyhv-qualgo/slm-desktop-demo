@@ -33,7 +33,7 @@ struct BenchmarkView: View {
 
     /// Every model that could be swept.
     private var availableModels: [SLMModelOption] {
-        ModelCatalog.taskModels.filter(\.isAvailable)
+        DesktopModels.taskModels.filter(\.isAvailable)
     }
 
     /// The models actually selected for this sweep.

@@ -6,8 +6,8 @@ DerivedData/
 .DS_Store
 __pycache__/
 
-# Binaries — supplied by scripts/bootstrap.sh (cloned from the iOS demo) and
-# scripts/build_tflite_macos.sh. Never commit models or frameworks.
+# Binaries — supplied by scripts/bootstrap.sh (cloned from the iOS demo, plus
+# the embedding model from Hugging Face). Never commit models or frameworks.
 Frameworks/
 Resources/
 

@@ -72,7 +72,7 @@ final class ConversationStore: ObservableObject {
     let loraStore = LoRAStore()
 
     /// The SLMs the user can switch between in Settings.
-    let availableModels = ModelCatalog.taskModels
+    let availableModels = DesktopModels.taskModels
 
     /// Language packs published for the currently selected checkpoint. Packs are
     /// per (model, language), so this list changes when the model does.
@@ -83,7 +83,7 @@ final class ConversationStore: ObservableObject {
     /// Display name of the currently selected on-device feature SLM — the model
     /// that runs translation / summarization / suggestions. Used to attribute
     /// on-device output (e.g. the summary sheet's footnote) to the chosen model.
-    var selectedModelName: String { ModelCatalog.taskModel(for: selectedModelID).displayName }
+    var selectedModelName: String { DesktopModels.taskModel(for: selectedModelID).displayName }
 
     private static let modelDefaultsKey = "selectedTaskModelID"
     private static let nativeLanguageKey = "nativeLanguageID"
@@ -112,8 +112,7 @@ final class ConversationStore: ObservableObject {
         // saved model's file is no longer bundled, then hand it to the service so
         // the first warm-up loads the right checkpoint.
         let saved = UserDefaults.standard.string(forKey: Self.modelDefaultsKey)
-        let option = saved.map(ModelCatalog.taskModel(for:)) ?? ModelCatalog.defaultTaskModel
-        let resolved = option.isAvailable ? option : ModelCatalog.defaultTaskModel
+        let resolved = DesktopModels.resolve(saved)
         selectedModelID = resolved.id
         service.taskModelResourceName = resolved.resourceName
         // The LoRA pack is keyed by (model, language), so the service needs the

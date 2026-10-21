@@ -11,7 +11,8 @@
 #  other branches (q4_0, v18). The list below is exactly what the catalogs in
 #  SLMChat/Engine reference, and where each file actually lives over there.
 #
-#  The TFLite C library is built separately: scripts/build_tflite_macos.sh.
+#  The TFLite runtime for the guardrail / image tagger comes from the LiteRT-LM
+#  Swift package (resolved by Xcode), as on iOS — nothing to build here.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -29,16 +30,13 @@ clone() {  # clone <src relative to iOS root> <dest dir>
   cp -cR "$src" "$dest" 2>/dev/null || cp -R "$src" "$dest"
 }
 
-# --- Base checkpoints (ModelCatalog) -----------------------------------------
-clone Resources/model.gguf                 Resources
+# --- Base checkpoints: the desktop subset (SLMChat/Engine/DesktopModels.swift)
+# Gemma-3 270M and Qwen3 0.6B are in ModelCatalog but not shipped on macOS.
 clone models-lab/qwen2.5-0.5b-v6.1.gguf    Resources
-clone models-lab/qwen3-0.6b-v6.gguf        Resources
 clone models-lab/qwen3.5-0.8b.gguf         Resources
 
-# --- LoRA language packs (LoRACatalog) ---------------------------------------
-clone Resources/lora-gemma3-270m-english.gguf    Resources
-clone Resources/lora-gemma3-270m-vietnamese.gguf Resources
-for base in qwen2.5-0.5b-v6.1 qwen3-0.6b-v6 qwen3.5-0.8b; do
+# --- LoRA language packs (LoRACatalog), for those two bases only ------------
+for base in qwen2.5-0.5b-v6.1 qwen3.5-0.8b; do
   clone "Resources/lora-$base-english.gguf" Resources
   for lang in vietnamese arabic spanish french russian chinese; do
     clone "models-lab/lora-$base-$lang.gguf" Resources
@@ -53,7 +51,9 @@ done
 for f in "$IOS"/Resources/guardrail-rules-*.json; do clone "Resources/$(basename "$f")" Resources; done
 
 # --- Language detection + image tagging --------------------------------------
-for f in langdetect.tflite langdetect-labels.txt langdetect-weights.json \
+# (No langdetect.tflite: LangDetect.swift runs the detector itself from the
+# extracted weights; the .tflite is never loaded.)
+for f in langdetect-labels.txt langdetect-weights.json \
          image-tagging.tflite image-tag-list.txt; do
   clone "Resources/$f" Resources
 done
@@ -82,10 +82,6 @@ fi
 
 # --- llama.cpp (already ships a macos-arm64 slice) ---------------------------
 clone Frameworks/llama.xcframework Frameworks
-
-# --- TFLite C library (built locally) -----------------------------------------
-[[ -e Frameworks/tflite/libtensorflowlite_c.dylib ]] \
-  || missing+=("Frameworks/tflite/libtensorflowlite_c.dylib (run scripts/build_tflite_macos.sh)")
 
 if (( ${#missing[@]} )); then
   echo "ERROR: missing:"; printf '  %s\n' "${missing[@]}"; exit 1

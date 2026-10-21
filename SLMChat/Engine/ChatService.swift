@@ -98,7 +98,9 @@ final class ChatService {
     /// because a LoRA pack is identified by (model, language) — an adapter is
     /// bound to the exact weights it was trained on, so the model half of the key
     /// has to travel with the load. See `LoRACatalog`.
-    var taskModelID = ModelCatalog.defaultTaskModel.id
+    var taskModelID = ModelCatalog.defaultTaskModel.id {
+        didSet { taskEngine.setPrefixReuse(prefixReuseActive) }
+    }
 
     /// The user's native language, chosen in Settings (default Vietnamese). Drives
     /// the default direction of the NLP features — translation goes native→English,
@@ -254,7 +256,20 @@ final class ChatService {
     /// measurement mode — see `SLMEngine.setPrefixReuse`. The store sets it from
     /// the persisted selection before the first warm-up.
     var prefixReuseEnabled: Bool = true {
-        didSet { taskEngine.setPrefixReuse(prefixReuseEnabled) }
+        didSet { taskEngine.setPrefixReuse(prefixReuseActive) }
+    }
+
+    /// Whether prefix reuse actually runs: off for Qwen3.5 whatever the setting.
+    /// It is hybrid attention/SSM (`qwen35`), and llama.cpp can't roll its SSM
+    /// state back to a token position, so a partial cache removal
+    /// is always refused and the slot gets cleared anyway — trying is wasted work.
+    /// Gate reuse-only work (the suggest pre-warm) on this, not on the setting.
+    var prefixReuseActive: Bool {
+        if taskModelID == "qwen3.5-0.8b" {
+            return false
+        } else {
+            return prefixReuseEnabled
+        }
     }
 
     /// When true, reply suggestions are generated automatically (gated + debounced)

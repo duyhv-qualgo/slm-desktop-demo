@@ -17,7 +17,6 @@ struct GroupChatView: View {
             liveBanner
             summaryBanner
             messageList
-            suggestionRow
             GroupInputBar(group: group, isReady: isReady)
         }
         .onAppear { group.isActive = true }
@@ -53,61 +52,6 @@ struct GroupChatView: View {
             }
             .buttonStyle(.plain)
             .disabled(group.isBusy || !isReady)
-        }
-    }
-
-    // MARK: - Suggestion chips
-
-    @ViewBuilder
-    private var suggestionRow: some View {
-        if !group.suggestions.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(group.suggestions, id: \.self) { s in
-                        SuggestionChip(text: s) { group.useSuggestion(s) }
-                    }
-                }
-                .padding(.horizontal).padding(.vertical, 8)
-            }
-        } else if let notice = group.notice {
-            HStack(spacing: 6) {
-                Image(systemName: group.missingPack == nil
-                      ? "info.circle" : "arrow.down.circle")
-                Text(notice)
-                // Same reason as the 1:1 screen: Settings can only install the
-                // native language's pack, so the offer has to live next to the
-                // notice that asks for a different one.
-                if let pack = group.missingPack {
-                    Spacer(minLength: 8)
-                    packInstallButton(pack)
-                }
-            }
-            .font(.caption).foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal).padding(.vertical, 8)
-        }
-    }
-
-    /// Get / progress / retry for the pack blocking suggestions in this group.
-    @ViewBuilder
-    private func packInstallButton(_ pack: LoRAAdapter) -> some View {
-        switch store.loraStore.state(of: pack) {
-        case .downloading(let progress):
-            if let progress {
-                ProgressView(value: progress).progressViewStyle(.linear).frame(width: 60)
-            } else {
-                ProgressView().controlSize(.small)
-            }
-        case .installed:
-            Button("Suggest") {
-                group.missingPack = nil
-                group.notice = nil
-                Task { await group.suggest() }
-            }
-            .font(.caption)
-        case .failed, .notInstalled:
-            Button("Get") { store.loraStore.download(pack) }
-                .font(.caption)
         }
     }
 
@@ -349,19 +293,6 @@ private struct GroupInputBar: View {
                         if press.modifiers.contains(.shift) { text += "\n" } else { send() }
                         return .handled
                     }
-                Button {
-                    Task { await group.suggest() }
-                } label: {
-                    if group.isSuggesting {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "sparkles").font(.system(size: 17))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .help("Suggest replies")
-                .disabled(group.isBusy || !isReady)
             }
             .padding(.horizontal, 18).padding(.vertical, 10)
             .background(Theme.field, in: RoundedRectangle(cornerRadius: 22))
@@ -376,9 +307,5 @@ private struct GroupInputBar: View {
             .disabled(!canSend)
         }
         .padding(.horizontal, 24).padding(.top, 8).padding(.bottom, 16)
-        // Mirror a tapped suggestion (which sets `group.input`) into the field.
-        .onChange(of: group.input) { newValue in
-            if !newValue.isEmpty, newValue != text { text = newValue }
-        }
     }
 }

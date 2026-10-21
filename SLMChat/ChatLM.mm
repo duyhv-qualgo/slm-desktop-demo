@@ -827,7 +827,8 @@ static std::string NormalizeRole(NSString *role) {
     if (!llama_memory_seq_rm(mem, (llama_seq_id)slot, (llama_pos)reused, /*p1=*/-1)) {
         // Logged because it is otherwise indistinguishable from "reuse is off":
         // both show as a cold prefill. On a hybrid/recurrent model (qwen35) this
-        // fires on every reuse attempt.
+        // fires on every reuse attempt — the app turns reuse off for those
+        // (ChatService.prefixReuseActive), so it only shows in direct ChatLM use.
         NSLog(@"[ChatLM] seq_rm refused partial removal at %zu (slot %d) — slot "
               @"cleared, %zu reusable tokens discarded", reused, slot, reused);
         llama_memory_seq_rm(mem, (llama_seq_id)slot, /*p0=*/-1, /*p1=*/-1);

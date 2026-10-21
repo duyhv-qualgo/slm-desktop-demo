@@ -13,12 +13,11 @@
 #  Output replaces Frameworks/llama.xcframework (the old one is kept in
 #  build/llama/previous/); provenance goes to Frameworks/llama-build.txt.
 #
-#  The pin is build tag b9721 (2026-06-19): what the iOS demo's prebuilt
-#  framework reports via ggml_commit() ("5fd2dc2-dirty"); its build script was
-#  lost, this replaces it. llama.cpp only got versioned releases (v0.1.0+) in
-#  Aug 2026 — b-tags are per-merge CI builds — so bump to a vX.Y.Z release,
-#  reading its "API changes" notes first: ChatLM.mm is written against b9721's
-#  API, and newer llama.cpp renamed fields (e.g. use_mmap → load_mode).
+#  The pin is release v0.7.0 (2026-10-15). llama.cpp has versioned releases
+#  (vX.Y.Z) since Aug 2026 — the bNNNN tags are per-merge CI builds — so bump
+#  to the next release, reading its "API changes" notes first. Before this the
+#  app ran b9721 (2026-06-19), what the iOS demo's framework is built from; the
+#  only port it needed was use_mmap → load_mode in ChatLM.mm.
 #
 #  Layout follows llama.cpp's own build-xcframework.sh — static libs folded
 #  into one dynamic framework, Metal shaders embedded, headers + module map —
@@ -36,7 +35,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 LLAMA_REPO="${LLAMA_REPO:-https://github.com/ggml-org/llama.cpp.git}"
-LLAMA_COMMIT="${LLAMA_COMMIT:-5fd2dc2c41c342a75c26f9756ca6b1814ed05fb4}"   # tag b9721, 2026-06-19
+LLAMA_COMMIT="${LLAMA_COMMIT:-620d2225cc436ab0b001e3200e590e3b286ef9ab}"   # v0.7.0 (= b11669), 2026-10-15
 MACOS_MIN=14.0
 IOS_MIN=16.0
 

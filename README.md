@@ -22,7 +22,7 @@ open SLMChatMac.xcodeproj               # scheme SLMChat, run on "My Mac"
 never written. It lists anything missing and exits non-zero.
 
 `llama.xcframework` is built from source by `scripts/build_llama_xcframework.sh`:
-llama.cpp at a pinned release tag (b9721, what the iOS framework was built from) plus any
+llama.cpp at a pinned release (v0.7.0; the iOS app is still on b9721 from June) plus any
 `scripts/llama-patches/*.patch`, arm64 only. Re-run it to rebuild; pass `ios` to
 add iPhone + simulator slices, or `LLAMA_COMMIT=<sha>` to try another llama.cpp.
 

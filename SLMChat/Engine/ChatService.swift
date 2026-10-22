@@ -346,11 +346,46 @@ final class ChatService {
     }
     let summaryTemp: Float = 0.3
     let translateTokens: Int32 = 160
-    // Per-chunk budget for translating a LONG message (see `translateLongStream`). Larger
-    // than `translateTokens` because a translation can be longer than its source
-    // (e.g. EN→VI expands), so a chunk needs headroom not to be cut off. Chunk
-    // (~150 tok) + instruction + this stays well under the ~1024-token context.
-    let translateChunkTokens: Int32 = 256
+    // Translation budget (see `translateLongStream`). One call is one 1024-token
+    // slot, shared by the prompt and the translation it generates — overrunning it
+    // fails the generation outright. A translation can be LONGER than its source:
+    // English → Vietnamese measured 1.27x (Qwen3.5) and 1.42x (Qwen2.5) the
+    // tokens, plus ~12 for the JSON the finetune wraps it in. So output gets the
+    // bigger share:
+    //
+    //     48 prompt overhead + 390 source + 580 output (≥ 1.42 × 390 + 24) = 1018
+    //
+    // The old split (720 source, 256 output) cut off any English text over ~180
+    // tokens before its last sentence.
+    static let translatePromptOverheadTokens = 48
+    let translateChunkInputTokens = 390
+    let translateChunkTokens: Int32 = 580
+    // Hard maximum for one message: two chunks. Chunks run one after another on
+    // the shared task model (~6.5 s each on Metal), so a longer text would hold it
+    // — and every other feature — for minutes; it is refused instead.
+    var translateMaxInputTokens: Int { 2 * translateChunkInputTokens }
+
+    /// Source tokens of `text` by the loaded model's tokenizer, or the character
+    /// estimate when nothing is loaded yet.
+    private func translationTokens(_ text: String) -> Int {
+        taskEngine.tokenCount(of: text) ?? Prompts.estimatedTokens(text)
+    }
+
+    /// Shown in place of a translation for a message over `translateMaxInputTokens`
+    /// (~560 English words). Persisted like any translation; Retranslate re-checks.
+    static let tooLongToTranslateNote = "(too long to translate on device)"
+
+    /// Over `translateMaxInputTokens`: the UI shows a "too long" note instead of
+    /// translating, and `translateLongStream` yields nothing.
+    func isTooLongToTranslate(_ text: String) -> Bool {
+        translationTokens(text.trimmingCharacters(in: .whitespacesAndNewlines)) > translateMaxInputTokens
+    }
+
+    /// Split at sentence (then clause, then word) boundaries into pieces of at most
+    /// `translateChunkInputTokens` — a short message is one piece.
+    func chunkForTranslation(_ text: String) -> [String] {
+        chunkForSummary(text, maxTokens: translateChunkInputTokens)
+    }
     let translateTemp: Float = 0.2
     let eventTokens: Int32 = 96
     let eventTemp: Float = 0.1   // near-deterministic structured extraction
@@ -1028,12 +1063,12 @@ final class ChatService {
     /// Translate a message of any length, streamed for the UI to render token by
     /// token.
     ///
-    /// Chunked because a single `complete` call caps output at `translateTokens`,
-    /// which truncates a long message's translation — so the text is split into
-    /// `Prompts.longChunkChars` pieces (a short message is just one), each
-    /// translated with the roomier `translateChunkTokens` budget and joined back in
-    /// order. Unlike a summary there is no reduce: every chunk's full translation
-    /// is kept.
+    /// Split into pieces of at most `translateChunkInputTokens` (a short message is
+    /// just one), each translated with the `translateChunkTokens` output budget and
+    /// joined back in order — see the budget arithmetic above. Unlike a summary
+    /// there is no reduce: every chunk's full translation is kept. A message over
+    /// `translateMaxInputTokens` is not translated at all (callers check
+    /// `isTooLongToTranslate` first to say why).
     ///
     /// Each element is the WHOLE translation so far — completed chunks joined with
     /// the chunk currently arriving — so a consumer just assigns it and never has
@@ -1047,9 +1082,7 @@ final class ChatService {
         let engine = taskEngine
         let temp = translateTemp
         let cap = translateChunkTokens
-        let chunks = chunkForSummary(text, maxTokens: Int(ChatLM.contextTokensPerSlot())
-                                                     - Int(translateChunkTokens)
-                                                     - Self.promptOverheadTokens)
+        let chunks = isTooLongToTranslate(text) ? [] : chunkForTranslation(text)
         // Detected ONCE over the whole message, not per chunk: a single chunk can
         // be too short to identify, and a message whose chunks disagreed about
         // their own language would translate inconsistently.

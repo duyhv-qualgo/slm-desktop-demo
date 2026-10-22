@@ -381,6 +381,12 @@ final class Conversation: ObservableObject, Identifiable {
         }
         guard !message.isTranslating else { return }
         if force { message.translation = nil }
+        // Over the on-device maximum: say so rather than translate part of it.
+        if service.isTooLongToTranslate(message.text) {
+            message.translation = ChatService.tooLongToTranslateNote
+            message.showTranslation = true
+            return
+        }
         message.isTranslating = true
         let target = Prompts.autoTarget(for: message.text,
                                         native: service.nativeLanguage)

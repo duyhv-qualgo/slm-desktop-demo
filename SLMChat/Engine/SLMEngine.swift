@@ -6,15 +6,11 @@ typealias Turn = [String: String]
 
 /// Identifies which app feature a `SLMEngine.complete`/`stream` call serves.
 /// Tags the `[SLMPerf]` log line (via `description`, unchanged from the raw
-/// strings the codebase used before — existing log filters keep matching) and
-/// decides whether the call's KV prefix is worth caching (`isCacheable`, see
-/// the `cacheable` note on `ChatLM.h`).
+/// strings the codebase used before — existing log filters keep matching).
 ///
 /// This exists instead of a bare `String` so the valid label set is
-/// compiler-checked: a typo used to silently fall through to "not cacheable"
-/// with no warning, which is exactly the kind of bug that quietly regresses
-/// auto-suggest latency without anyone noticing. Add a case here — not a new
-/// string literal at the call site — when a new feature needs one.
+/// compiler-checked. Add a case here — not a new string literal at the call
+/// site — when a new feature needs one.
 enum SLMFeatureLabel: Equatable, CustomStringConvertible {
     /// Default for `-complete`, e.g. a one-shot call not naming a feature.
     case complete
@@ -22,14 +18,10 @@ enum SLMFeatureLabel: Equatable, CustomStringConvertible {
     case stream
     /// Auto-reply suggestion chips (1:1 or group).
     case suggest
-    /// Background prefill of the NEXT suggest's prompt, fired when the user
-    /// sends (see `Conversation.prewarmNextSuggest`). Generates nothing.
-    case suggestPrewarm
     /// Whole-conversation or unread-window summary.
     case summarize
     /// One chunk of a long-message map-reduce summary. `phase` is a free-form
     /// log tag ("MAP", "REDUCE#1", …) — see `ChatService.summarizeChunks`.
-    /// Always non-cacheable regardless of `phase`.
     case summarizeChunk(phase: String)
     /// Message translation.
     case translate
@@ -46,32 +38,12 @@ enum SLMFeatureLabel: Equatable, CustomStringConvertible {
         case .complete:                    return "complete"
         case .stream:                      return "stream"
         case .suggest:                     return "suggest"
-        case .suggestPrewarm:              return "suggest-prewarm"
         case .summarize:                   return "summarize"
         case .summarizeChunk(let phase):   return "summarize-\(phase.lowercased())"
         case .translate:                   return "translate"
         case .translateQuery:              return "translate-query"
         case .event:                       return "event"
         case .compose:                     return "compose"
-        }
-    }
-
-    /// Whether this feature repeats a near-identical prompt across calls, so
-    /// its KV prefix is worth keeping in a slot of its own. Auto-suggest does;
-    /// everything else wraps a fresh prompt around a single message and never
-    /// sees it again, so caching gains nothing and would only evict the feature
-    /// that benefits. See the `cacheable` parameter note on `ChatLM.h`.
-    ///
-    /// `.compose` is false despite sharing auto-suggest's conversation block:
-    /// the chip's instruction sits in the FIRST line of the prompt and changes
-    /// with every tap, so the shared part is never a shared PREFIX. Marking it
-    /// cacheable would buy nothing and evict the auto-suggest prefix that the
-    /// 3 s budget depends on.
-    var isCacheable: Bool {
-        switch self {
-        case .suggest, .suggestPrewarm, .stream, .complete: return true
-        case .summarize, .summarizeChunk, .translate, .translateQuery,
-             .event, .compose: return false
         }
     }
 }
@@ -271,7 +243,6 @@ final class SLMEngine {
                           lora, ok ? "ok" : "FAILED", -t0.timeIntervalSinceNow)
                 }
                 if ok {
-                    b.prefixReuseEnabled = self?.prefixReuseEnabled ?? true
                     self?.bridge = b
                     self?.loadedModelName = modelName
                     cont.resume(returning: (true, nil))
@@ -310,20 +281,6 @@ final class SLMEngine {
         return Int(bridge.tokenCount(of: text))
     }
 
-    /// Turn KV prefix reuse on/off. Off makes every call pay a full prompt pass,
-    /// which is the only way to read a true prefill tok/s — with reuse on, the
-    /// rate is per evaluated token and a cached turn reports almost nothing.
-    ///
-    /// Applied to the live engine and remembered, so a reload (model, language or
-    /// backend switch) doesn't silently turn caching back on mid-measurement.
-    func setPrefixReuse(_ enabled: Bool) {
-        prefixReuseEnabled = enabled
-        queue.async { [weak self] in self?.bridge?.prefixReuseEnabled = enabled }
-    }
-
-    /// Remembered so `warmUp` can re-apply it to a freshly loaded bridge.
-    private(set) var prefixReuseEnabled = true
-
     /// Load a LoRA pack into the engine ahead of the call that needs it, so the
     /// one-off `.gguf` parse doesn't land inside a latency-budgeted generation.
     ///
@@ -336,36 +293,11 @@ final class SLMEngine {
         queue.async { [weak self] in self?.bridge?.prewarmAdapter(path: path) }
     }
 
-    /// Evaluate the stable prefix of `user` into a cacheable slot without
-    /// generating — see `ChatLM.prefill`. Serialized like every other call, so a
-    /// generation queued behind it always sees the finished prefix. Returns the
-    /// pass's metrics (`promptTokenCount` = tokens now cached), or nil if it did
-    /// nothing.
-    func prefill(user: String,
-                 label: SLMFeatureLabel = .suggestPrewarm,
-                 adapterPath: String? = nil) async -> ChatLMTurnMetrics? {
-        await withCheckedContinuation { cont in
-            queue.async { [weak self] in
-                guard let self, let bridge = self.bridge else {
-                    cont.resume(returning: nil); return
-                }
-                let queued = Date()
-                let n = bridge.prefill(system: nil, history: [], user: user,
-                                       adapterPath: adapterPath)
-                guard n > 0 else { cont.resume(returning: nil); return }
-                self.logPerf(label: label.description, bridge: bridge,
-                             callSeconds: -queued.timeIntervalSinceNow,
-                             maxTokens: 0, temperature: 0)
-                cont.resume(returning: bridge.lastTurnMetrics)
-            }
-        }
-    }
-
     /// Blocking generation, serialized and off-main. Returns the trimmed reply.
     ///
     /// `label` names the feature this call serves and only tags the
-    /// `[SLMPerf]` line / decides cacheability (see `SLMFeatureLabel`); it has
-    /// no other effect on generation.
+    /// `[SLMPerf]` line (see `SLMFeatureLabel`); it has no other effect on
+    /// generation.
     func complete(system: String?,
                   history: [Turn],
                   user: String,
@@ -373,24 +305,10 @@ final class SLMEngine {
                   temperature: Float,
                   label: SLMFeatureLabel = .complete,
                   adapterPath: String? = nil) async -> String? {
-        await completeMeasured(system: system, history: history, user: user,
-                               maxTokens: maxTokens, temperature: temperature,
-                               label: label, adapterPath: adapterPath).text
-    }
-
-    /// `complete`, plus the turn's metrics read on the engine queue — the only
-    /// place they can't be overwritten by the next call before the caller looks.
-    func completeMeasured(system: String?,
-                          history: [Turn],
-                          user: String,
-                          maxTokens: Int32,
-                          temperature: Float,
-                          label: SLMFeatureLabel = .complete,
-                          adapterPath: String? = nil) async -> (text: String?, metrics: ChatLMTurnMetrics?) {
         await withCheckedContinuation { cont in
             queue.async { [weak self] in
                 guard let self, let bridge = self.bridge else {
-                    cont.resume(returning: (nil, nil)); return
+                    cont.resume(returning: nil); return
                 }
                 let queued = Date()
                 let out = bridge.generate(system: system,
@@ -398,14 +316,12 @@ final class SLMEngine {
                                           user: user,
                                           maxTokens: maxTokens,
                                           temperature: temperature,
-                                          cacheable: label.isCacheable,
                                           adapterPath: adapterPath)
                 self.logPerf(label: label.description, bridge: bridge,
                              callSeconds: -queued.timeIntervalSinceNow,
                              maxTokens: maxTokens, temperature: temperature)
                 if out == nil { NSLog("[SLMEngine] generate → nil, lastError=%@", bridge.lastError) }
-                cont.resume(returning:
-                    (out?.trimmingCharacters(in: .whitespacesAndNewlines), bridge.lastTurnMetrics))
+                cont.resume(returning: out?.trimmingCharacters(in: .whitespacesAndNewlines))
             }
         }
     }
@@ -431,7 +347,6 @@ final class SLMEngine {
                               user: user,
                               maxTokens: maxTokens,
                               temperature: temperature,
-                              cacheable: label.isCacheable,
                               onChunk: onChunk)
                 self.logPerf(label: label.description, bridge: bridge,
                              callSeconds: -queued.timeIntervalSinceNow,

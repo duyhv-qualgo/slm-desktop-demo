@@ -114,8 +114,7 @@ final class MapChunkBudgetTests: XCTestCase {
         let svc = ChatService()
         let prompt = Prompts.summarizeText(vietnameseChunk, language: "Vietnamese", speaker: "Mai")
         _ = lm.generate(system: nil, history: [], user: prompt,
-                        maxTokens: svc.summaryMapTokens, temperature: 0.3,
-                        cacheable: false, adapterPath: nil)
+                        maxTokens: svc.summaryMapTokens, temperature: 0.3, adapterPath: nil)
         let m = try XCTUnwrap(lm.lastTurnMetrics)
 
         print("MAPBUDGET in=\(vietnameseChunk.count) chars out=\(m.decodeTokenCount) tok "
@@ -166,7 +165,7 @@ final class ChunkBoundaryTests: XCTestCase {
     }
 }
 
-/// A prompt longer than the per-slot context must fail cleanly, not corrupt memory.
+/// A prompt longer than the context must fail cleanly, not corrupt memory.
 ///
 /// Regression test for a real crash: `_batch` holds 1024 tokens and
 /// `-decode:count:` used to write `count` entries into it unchecked, so a
@@ -184,22 +183,20 @@ final class OverlongPromptTests: XCTestCase {
             throw XCTSkip("load failed: \(lm.lastError)")
         }
 
-        // ~2000 tokens: comfortably past the 1024-token per-slot context.
+        // ~2000 tokens: comfortably past the 1024-token context.
         let huge = String(repeating: "The quick brown fox jumps over the lazy dog. ", count: 200)
         XCTAssertGreaterThan(lm.tokenCount(of: huge), 1024, "test prompt must exceed the limit")
 
         // The bar is simply: we get here at all, with an error rather than a crash.
         let out = lm.generate(system: nil, history: [], user: huge,
-                              maxTokens: 4, temperature: 0.1,
-                              cacheable: false, adapterPath: nil)
+                              maxTokens: 4, temperature: 0.1, adapterPath: nil)
         XCTAssertNil(out, "an over-long prompt should fail, not return text")
         XCTAssertFalse(lm.lastError.isEmpty, "the failure must be reported")
         print("OVERLONG rejected cleanly: \(lm.lastError)")
 
         // And the engine must still be usable afterwards.
         let ok = lm.generate(system: nil, history: [], user: "Say hello.",
-                             maxTokens: 4, temperature: 0.1,
-                             cacheable: false, adapterPath: nil)
+                             maxTokens: 4, temperature: 0.1, adapterPath: nil)
         XCTAssertNotNil(ok, "engine should survive a rejected prompt")
     }
 }
@@ -243,16 +240,16 @@ final class TokenChunkingTests: XCTestCase {
         }
     }
 
-    /// Prompt + generated output must fit ONE slot. This is the invariant the
+    /// Prompt + generated output must fit the context. This is the invariant the
     /// derived budget exists to hold; a hardcoded 800 would violate it the moment
     /// the output budget moved.
     func testBudgetLeavesRoomForTheGeneratedSummary() throws {
         let svc = try ChatService()
-        let total = Int(ChatLM.contextTokensPerSlot())
+        let total = Int(ChatLM.contextTokens())
         let used = svc.summaryChunkTokens + Int(svc.summaryMapTokens)
         print("TOKCHUNK context=\(total) chunk=\(svc.summaryChunkTokens) "
               + "+ output=\(svc.summaryMapTokens) = \(used)")
-        XCTAssertLessThan(used, total, "chunk + output must fit the slot")
+        XCTAssertLessThan(used, total, "chunk + output must fit the context")
         XCTAssertGreaterThan(total - used, 24, "too little headroom for template + instruction")
     }
 }

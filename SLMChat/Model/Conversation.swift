@@ -92,22 +92,6 @@ final class Conversation: ObservableObject, Identifiable {
     /// once-per-message cap — see `scheduleAutoSuggest`.
     private var lastAutoSuggestedID: UUID?
 
-    /// What the last send pre-warmed for the next suggest (see
-    /// `prewarmNextSuggest`), kept so the suggest can say whether it was served
-    /// from it and, if not, why. `tokens` is nil until the prefill returns.
-    private struct SuggestPrewarm {
-        let id = UUID()
-        let windowStart: Int
-        let language: TranslateLanguage
-        let adapter: String?
-        var tokens: Int?
-    }
-    private var suggestPrewarm: SuggestPrewarm?
-
-    /// Window start and language of the previous suggest in this chat — a change
-    /// in either means the prompt's prefix moved (a re-anchor), which is the
-    /// only kind of turn allowed to evaluate the whole window.
-    private var lastSuggestWindow: (start: Int, language: TranslateLanguage)?
 
     /// Shared model plumbing. `unowned` because the store owns both the service and
     /// every conversation for the app's lifetime.
@@ -202,7 +186,6 @@ final class Conversation: ObservableObject, Identifiable {
         let mine = ChatMessage(sender: .you, text: text)
         messages.append(mine)
         persist()
-        prewarmNextSuggest()
         Task { await detectEvent(in: mine) }
         Task { await classifySafety(in: mine) }
         Task { await replyFromFriend() }
@@ -453,9 +436,6 @@ final class Conversation: ObservableObject, Identifiable {
         var result = Prompts.SuggestionResult(suggestions: [], refused: false, reason: nil)
         var sawEngineError = false
         var attempts = 0
-        // The FIRST attempt's metrics are the ones that say whether the cache
-        // worked; a retry re-sends the same prompt and is served almost whole.
-        var firstMetrics: ChatLMTurnMetrics?
 
         // Sample up to 3× (temperature 0.8): a single generation can come back empty
         // or malformed, so retry until we get chips or an explicit refusal. Each
@@ -463,11 +443,10 @@ final class Conversation: ObservableObject, Identifiable {
         // latency budget, so the turn log reports how many ran.
         for attempt in 0..<3 {
             attempts = attempt + 1
-            let (out, metrics) = await service.taskEngine.completeMeasured(
+            let out = await service.taskEngine.complete(
                 system: nil, history: [], user: prompt,
                 maxTokens: service.suggestTokens, temperature: service.suggestTemp,
                 label: .suggest, adapterPath: adapter)
-            if attempt == 0 { firstMetrics = metrics }
             guard let raw = out else {
                 sawEngineError = true
                 NSLog("[Suggest] attempt %d → SLM returned nil (engine error)", attempt + 1)
@@ -492,118 +471,14 @@ final class Conversation: ObservableObject, Identifiable {
             notice = "No suggestion right now — try again."
         }
         // `window` is the block-quantized history slice (see Prompts.historyWindowStride).
-        // A stable start across consecutive turns is what lets the engine's KV cache
-        // skip re-prefilling — if `cached` on the [SLMPerf] line stays tiny while this
-        // start holds steady, the prefix is being broken somewhere else in the prompt.
         let start = Prompts.windowStart(messageCount: messages.count,
                                         window: Prompts.suggestWindow,
                                         stride: Prompts.suggestStride)
-        logSuggestKV(firstMetrics, windowStart: start, language: language, adapter: adapter)
         turn.finish("attempts=\(attempts) chips=\(suggestions.count) "
                   + "prompt=\(prompt.count) chars "
                   + "window=\(start)..\(messages.count) (\(messages.count - start) msgs, "
                   + "stride=\(Prompts.suggestStride))")
         isSuggesting = false
-    }
-
-    /// One `[SuggestKV]` line per suggest — `eval` (prompt tokens actually run
-    /// through the model) is the number the 3 s budget depends on; target ≤60 on
-    /// steady turns — plus a `re-anchor` line whenever the window moved, saying
-    /// whether the pre-warmed slot absorbed it or the suggest paid a full prefill.
-    /// Consumes the pending pre-warm either way.
-    private func logSuggestKV(_ m: ChatLMTurnMetrics?, windowStart start: Int,
-                              language: TranslateLanguage, adapter: String?) {
-        defer {
-            suggestPrewarm = nil
-            lastSuggestWindow = (start, language)
-        }
-        guard let m else {
-            NSLog("[SuggestKV] no metrics (engine error) window=%d..%d", start, messages.count)
-            return
-        }
-        let cached = Int(m.cachedPrefixTokenCount)
-        let prewarm: String
-        let prewarmHit: Bool
-        if let pw = suggestPrewarm {
-            if let n = pw.tokens, cached >= n {
-                prewarm = "hit(\(n))"; prewarmHit = true
-            } else {
-                // Reuse switched off (Settings → Diagnostics) discards every
-                // slot on purpose; say so rather than blaming eviction.
-                let why = !service.prefixReuseEnabled ? "reuse-off"
-                    : !service.prefixReuseActive ? "model-off"
-                    : pw.windowStart != start ? "window-moved"
-                    : pw.language != language ? "language-changed"
-                    : pw.adapter != adapter ? "pack-changed"
-                    : pw.tokens == nil ? "not-ready"
-                    : "evicted"
-                prewarm = "miss(\(why)\(pw.tokens.map { ",\($0)" } ?? ""))"; prewarmHit = false
-            }
-        } else {
-            prewarm = "none"; prewarmHit = false
-        }
-        let reanchor: String
-        switch lastSuggestWindow {
-        case nil:                                   reanchor = "first"
-        case let prev? where prev.language != language: reanchor = "language"
-        case let prev? where prev.start != start:   reanchor = "window"
-        default:                                    reanchor = "no"
-        }
-        NSLog("[SuggestKV] eval=%d in=%d cached=%d slot=%d reanchor=%@ prewarm=%@ window=%d..%d stride=%d",
-              m.prefillTokenCount, m.promptTokenCount, cached, m.cacheSlotIndex,
-              reanchor, prewarm, start, messages.count, Prompts.suggestStride)
-        if reanchor != "no" {
-            NSLog("[SuggestKV] re-anchor (%@) window=%d..%d served=%@ eval=%d",
-                  reanchor, start, messages.count,
-                  prewarmHit ? "prewarm" : "full-prefill", m.prefillTokenCount)
-        }
-    }
-
-    /// Prefill the next suggest's prompt NOW, while the reply is in flight.
-    ///
-    /// Everything the next suggest will read except the reply itself is already
-    /// known when the user sends: the window it will use (computed for one more
-    /// message), the language, the pack. `ChatLM.prefill` evaluates that into a
-    /// cacheable slot, so the suggest only pays for the incoming message and the
-    /// template tail. On a re-anchor the prefix is new and lands in the other
-    /// cacheable slot (LRU), leaving the current one intact — that is the
-    /// ping-pong, and it falls out of the existing slot rules.
-    ///
-    /// Speculative by design. A second send supersedes the first; a friend burst,
-    /// language switch or pack change turns it into a logged miss. No race with
-    /// the suggest is possible: both run on the engine's serial queue, so a
-    /// suggest that arrives early waits for the prefill and then reuses it.
-    private func prewarmNextSuggest() {
-        // With prefix reuse off — by setting, or for a model it's off for
-        // (ChatService.prefixReuseActive) — the suggest throws the slot away
-        // anyway, so a pre-warm would be pure wasted prefill.
-        guard service.autoSuggestEnabled, service.prefixReuseActive, isActive else { return }
-        let language = Prompts.conversationLanguage(messages, native: service.nativeLanguage)
-        let adapter: String?
-        switch service.suggestAdapter(for: language) {
-        case .pack(let path): adapter = path
-        case .loaded:         adapter = nil
-        case .missing:        return   // suggest will raise the notice; nothing to warm
-        }
-        let start = Prompts.windowStart(messageCount: messages.count + 1,
-                                        window: Prompts.suggestWindow,
-                                        stride: Prompts.suggestStride)
-        let prefix = Prompts.suggestPrewarmPrefix(history: messages, friendName: contactName,
-                                                  language: language)
-        let pending = SuggestPrewarm(windowStart: start, language: language,
-                                     adapter: adapter, tokens: nil)
-        suggestPrewarm = pending
-        Task { [weak self] in
-            guard let self else { return }
-            let m = await self.service.taskEngine.prefill(user: prefix, adapterPath: adapter)
-            // Only record against the pre-warm this task started — a later send
-            // may already have replaced it.
-            guard self.suggestPrewarm?.id == pending.id else { return }
-            self.suggestPrewarm?.tokens = m.map { Int($0.promptTokenCount) }
-            NSLog("[SuggestKV] prewarm window=%d..%d tokens=%d eval=%d slot=%d",
-                  start, self.messages.count + 1,
-                  m?.promptTokenCount ?? -1, m?.prefillTokenCount ?? -1, m?.cacheSlotIndex ?? -1)
-        }
     }
 
     func useSuggestion(_ text: String) {

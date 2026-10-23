@@ -58,14 +58,14 @@ final class TranslateBudgetTests: XCTestCase {
         return last
     }
 
-    /// prompt overhead + one chunk + its output must fit one slot, or the
+    /// prompt overhead + one chunk + its output must fit the context, or the
     /// generation fails outright when it runs into the ceiling.
-    func testBudgetFitsOneSlot() {
+    func testBudgetFitsContext() {
         let svc = ChatService()
         XCTAssertLessThanOrEqual(
             ChatService.translatePromptOverheadTokens + svc.translateChunkInputTokens
                 + Int(svc.translateChunkTokens),
-            Int(ChatLM.contextTokensPerSlot()))
+            Int(ChatLM.contextTokens()))
         XCTAssertEqual(svc.translateMaxInputTokens, 2 * svc.translateChunkInputTokens)
     }
 

@@ -43,12 +43,6 @@ final class ConversationStore: ObservableObject {
     /// at the app root via `.preferredColorScheme`. Persisted across launches.
     @Published private(set) var appearance: AppearanceMode
 
-    /// Whether the engine may reuse cached prompt prefixes. Default on; turning it
-    /// off is a diagnostic that makes every call pay a full prefill, so the
-    /// `[SLMPerf]` prefill tok/s becomes a true throughput figure instead of a
-    /// per-evaluated-token one. Persisted so a measurement survives a relaunch.
-    @Published private(set) var prefixReuseEnabled: Bool
-
     /// Whether reply suggestions auto-generate when it's your turn (vs. only on the
     /// suggest button). Chosen in Settings, default on. Persisted across launches.
     @Published private(set) var autoSuggestEnabled: Bool
@@ -90,7 +84,6 @@ final class ConversationStore: ObservableObject {
     private static let appearanceKey = "appearanceMode"
     private static let autoSuggestKey = "autoSuggestEnabled"
     private static let backendKey = "slmBackendOption"
-    private static let prefixReuseKey = "slmPrefixReuseEnabled"
     private static let guardRegionKey = "guardRegion"
 
     let service = ChatService()
@@ -148,10 +141,6 @@ final class ConversationStore: ObservableObject {
         let autoSuggest = UserDefaults.standard.object(forKey: Self.autoSuggestKey) as? Bool ?? true
         autoSuggestEnabled = autoSuggest
         service.autoSuggestEnabled = autoSuggest
-
-        let reuse = UserDefaults.standard.object(forKey: Self.prefixReuseKey) as? Bool ?? true
-        prefixReuseEnabled = reuse
-        service.prefixReuseEnabled = reuse
 
         // Restore the compute backend (default: auto) BEFORE the first warm-up, so
         // the models load on the chosen backend instead of loading twice.
@@ -387,14 +376,6 @@ final class ConversationStore: ObservableObject {
 
     /// Toggle auto-suggest, push it to the shared service so open chats pick it up
     /// immediately, and persist the choice.
-    /// Toggle KV prefix reuse. Takes effect on the next generation — no reload.
-    func setPrefixReuse(_ enabled: Bool) {
-        guard enabled != prefixReuseEnabled else { return }
-        prefixReuseEnabled = enabled
-        service.prefixReuseEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: Self.prefixReuseKey)
-    }
-
     func setAutoSuggest(_ enabled: Bool) {
         guard enabled != autoSuggestEnabled else { return }
         autoSuggestEnabled = enabled

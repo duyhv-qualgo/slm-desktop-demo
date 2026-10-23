@@ -39,15 +39,14 @@ final class PrefillThreadsProbe: XCTestCase {
                 guard lm.load(modelPath: path, backend: SLMBackend.cpu, cacheDir: nil, loraPath: nil) else {
                     XCTFail("\(name) failed to load: \(lm.lastError)"); continue
                 }
-                lm.prefixReuseEnabled = false
                 // One warm-up (page in weights), then three measured passes.
                 var rates: [Double] = []
                 var tokens = 0
                 for i in 0..<4 {
                     _ = lm.generate(system: nil, history: [], user: prompt, maxTokens: 1,
-                                    temperature: 0.1, cacheable: true, adapterPath: nil)
+                                    temperature: 0.1, adapterPath: nil)
                     guard let m = lm.lastTurnMetrics else { continue }
-                    tokens = Int(m.prefillTokenCount)
+                    tokens = Int(m.promptTokenCount)
                     if i > 0 { rates.append(m.prefillTokensPerSecond) }
                 }
                 let med = rates.sorted()[rates.count / 2]

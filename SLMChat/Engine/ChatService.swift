@@ -98,9 +98,7 @@ final class ChatService {
     /// because a LoRA pack is identified by (model, language) — an adapter is
     /// bound to the exact weights it was trained on, so the model half of the key
     /// has to travel with the load. See `LoRACatalog`.
-    var taskModelID = ModelCatalog.defaultTaskModel.id {
-        didSet { taskEngine.setPrefixReuse(prefixReuseActive) }
-    }
+    var taskModelID = ModelCatalog.defaultTaskModel.id
 
     /// The user's native language, chosen in Settings (default Vietnamese). Drives
     /// the default direction of the NLP features — translation goes native→English,
@@ -252,26 +250,6 @@ final class ChatService {
     /// request lands on CPU where Metal isn't available. nil before any load.
     var activeBackend: String? { taskEngine.activeBackend }
 
-    /// Whether the task engine may reuse cached prompt prefixes. Off is a
-    /// measurement mode — see `SLMEngine.setPrefixReuse`. The store sets it from
-    /// the persisted selection before the first warm-up.
-    var prefixReuseEnabled: Bool = true {
-        didSet { taskEngine.setPrefixReuse(prefixReuseActive) }
-    }
-
-    /// Whether prefix reuse actually runs: off for Qwen3.5 whatever the setting.
-    /// It is hybrid attention/SSM (`qwen35`), and llama.cpp can't roll its SSM
-    /// state back to a token position, so a partial cache removal
-    /// is always refused and the slot gets cleared anyway — trying is wasted work.
-    /// Gate reuse-only work (the suggest pre-warm) on this, not on the setting.
-    var prefixReuseActive: Bool {
-        if taskModelID == "qwen3.5-0.8b" {
-            return false
-        } else {
-            return prefixReuseEnabled
-        }
-    }
-
     /// When true, reply suggestions are generated automatically (gated + debounced)
     /// once it's the user's turn in the open chat, instead of only on a button tap.
     /// The store sets it from the persisted selection.
@@ -315,7 +293,7 @@ final class ChatService {
 
     /// Tokens of SOURCE TEXT one map chunk may carry.
     ///
-    /// Derived, never hardcoded: the slot holds `contextTokensPerSlot`, and the
+    /// Derived, never hardcoded: the context holds `contextTokens`, and the
     /// prompt and everything generated from it must both fit. Writing a literal
     /// here would silently overrun the moment someone raised `summaryMapTokens` or
     /// lowered the context — the two numbers are not independent.
@@ -325,7 +303,7 @@ final class ChatService {
     /// (The raw arithmetic allows ~800; the overhead figure is what buys the
     /// margin that keeps a long generation from running into the ceiling.)
     var summaryChunkTokens: Int {
-        max(64, Int(ChatLM.contextTokensPerSlot()) - Int(summaryMapTokens)
+        max(64, Int(ChatLM.contextTokens()) - Int(summaryMapTokens)
                 - Self.promptOverheadTokens)
     }
 
@@ -347,7 +325,7 @@ final class ChatService {
     let summaryTemp: Float = 0.3
     let translateTokens: Int32 = 160
     // Translation budget (see `translateLongStream`). One call is one 1024-token
-    // slot, shared by the prompt and the translation it generates — overrunning it
+    // context, shared by the prompt and the translation it generates — overrunning it
     // fails the generation outright. A translation can be LONGER than its source:
     // English → Vietnamese measured 1.27x (Qwen3.5) and 1.42x (Qwen2.5) the
     // tokens, plus ~12 for the JSON the finetune wraps it in. So output gets the
@@ -766,7 +744,7 @@ final class ChatService {
     /// right end to keep: "what did I miss" is about recent messages, and the older
     /// ones are the ones the user most likely already read.
     ///
-    /// 2048 is deliberately larger than one slot (1024): the transcript is chunked
+    /// 2048 is deliberately larger than the context (1024): the transcript is chunked
     /// and folded, so the ceiling is what the summarizer can READ, not what fits a
     /// single call.
     let summaryMaxInputTokens = 2048
@@ -775,7 +753,7 @@ final class ChatService {
     /// call.
     ///
     /// Replaces a single unbounded `summarizeStream` on the rendered prompt, which
-    /// simply failed once the transcript passed the slot — observed at 1385 tokens,
+    /// simply failed once the transcript passed the context — observed at 1385 tokens,
     /// where the engine (correctly) refused rather than overrunning its batch.
     ///
     /// Chunks are groups of whole MESSAGES, never split mid-message: each group is

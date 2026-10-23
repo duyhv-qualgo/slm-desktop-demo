@@ -46,7 +46,7 @@ final class ModelSwapProbe: XCTestCase {
     /// shape, so prefill SECONDS (not tok/s) compare directly across languages.
     ///
     /// At this full length LFM2.5 tokenizes it to ~1109 tokens (Gemma: 462), past
-    /// the app's 1024-token slot, so it fails on LFM2.5 — kept to show that.
+    /// the app's 1024-token context, so it fails on LFM2.5 — kept to show that.
     /// `repeats: 2` is the version both models fit, for timing.
     private func vietnamesePrompt(repeats: Int = 4) -> String {
         let body = (0..<repeats).map { _ in vietnameseSample }.joined(separator: "\n")
@@ -72,9 +72,9 @@ final class ModelSwapProbe: XCTestCase {
         var prefill: [Double] = []
         for i in 0..<4 {
             _ = lm.generate(system: nil, history: [], user: prompt, maxTokens: 1,
-                            temperature: 0.1, cacheable: true, adapterPath: nil)
+                            temperature: 0.1, adapterPath: nil)
             guard let m = lm.lastTurnMetrics else { continue }
-            r.promptTokens = Int(m.prefillTokenCount)
+            r.promptTokens = Int(m.promptTokenCount)
             if i > 0 { prefill.append(m.prefillSeconds) }
         }
         r.prefillSeconds = prefill.sorted()[prefill.count / 2]
@@ -84,7 +84,7 @@ final class ModelSwapProbe: XCTestCase {
         var runs: [Result] = []
         for _ in 0..<3 {
             let out = lm.generate(system: nil, history: [], user: prompt, maxTokens: 128,
-                                  temperature: 0.1, cacheable: true, adapterPath: nil) ?? "<nil>"
+                                  temperature: 0.1, adapterPath: nil) ?? "<nil>"
             guard let m = lm.lastTurnMetrics, m.decodeSeconds > 0 else { continue }
             var d = r
             d.output = out
@@ -117,7 +117,6 @@ final class ModelSwapProbe: XCTestCase {
             }
             let loadS = Date().timeIntervalSince(t0)
             let loadedMB = footprintMB() - base
-            lm.prefixReuseEnabled = false
 
             for (lang, prompt) in [("en", englishPrompt), ("vi", vietnamesePrompt()), ("vi-half", vietnamesePrompt(repeats: 2))] {
                 let r = measure(lm, prompt)

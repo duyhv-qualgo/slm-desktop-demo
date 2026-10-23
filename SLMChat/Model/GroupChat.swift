@@ -485,16 +485,10 @@ final class GroupChat: ObservableObject {
         // Each retry is a full extra generation; the turn log reports how many ran.
         for attempt in 0..<3 {
             attempts = attempt + 1
-            let (out, metrics) = await service.taskEngine.completeMeasured(
+            let out = await service.taskEngine.complete(
                 system: nil, history: [], user: prompt,
                 maxTokens: service.suggestTokens, temperature: service.suggestTemp,
                 label: .suggest, adapterPath: adapter)
-            if attempt == 0, let m = metrics {
-                // Same `eval` metric as the 1:1 path; group chat has no pre-warm.
-                NSLog("[SuggestKV] group eval=%d in=%d cached=%d slot=%d prewarm=none",
-                      m.prefillTokenCount, m.promptTokenCount, m.cachedPrefixTokenCount,
-                      m.cacheSlotIndex)
-            }
             guard let raw = out else { continue }
             result = Prompts.parseSuggestions(raw)
             if result.refused || !result.suggestions.isEmpty { break }

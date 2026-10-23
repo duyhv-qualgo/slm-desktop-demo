@@ -47,10 +47,10 @@ final class TurnMetricsTests: XCTestCase {
     func testPrefillIsMeasuredNotReportedAsZero() throws {
         let lm = try loadedEngine()
         _ = lm.generate(system: nil, history: [], user: longPrompt,
-                        maxTokens: 8, temperature: 0.1, cacheable: false, adapterPath: nil)
+                        maxTokens: 8, temperature: 0.1, adapterPath: nil)
 
         let m = try XCTUnwrap(lm.lastTurnMetrics)
-        XCTAssertGreaterThan(m.prefillTokenCount, 1, "prompt should not have collapsed to one token")
+        XCTAssertGreaterThan(m.promptTokenCount, 1, "prompt should not have collapsed to one token")
         XCTAssertGreaterThan(m.prefillSeconds, 0,
                              "a multi-token prompt pass cannot take zero time")
         XCTAssertLessThan(m.prefillTokensPerSecond, 100_000,
@@ -65,7 +65,7 @@ final class TurnMetricsTests: XCTestCase {
     func testBreakdownAccountsForTheTotal() throws {
         let lm = try loadedEngine()
         _ = lm.generate(system: nil, history: [], user: longPrompt,
-                        maxTokens: 8, temperature: 0.1, cacheable: false, adapterPath: nil)
+                        maxTokens: 8, temperature: 0.1, adapterPath: nil)
 
         let m = try XCTUnwrap(lm.lastTurnMetrics)
         XCTAssertGreaterThan(m.totalSeconds, 0)
@@ -85,7 +85,7 @@ final class TurnMetricsTests: XCTestCase {
     func testTimeToFirstTokenCoversThePrefill() throws {
         let lm = try loadedEngine()
         _ = lm.generate(system: nil, history: [], user: longPrompt,
-                        maxTokens: 8, temperature: 0.1, cacheable: false, adapterPath: nil)
+                        maxTokens: 8, temperature: 0.1, adapterPath: nil)
 
         let m = try XCTUnwrap(lm.lastTurnMetrics)
         XCTAssertGreaterThanOrEqual(m.timeToFirstTokenSeconds, m.prefillSeconds)
@@ -98,7 +98,7 @@ final class TurnMetricsTests: XCTestCase {
     func testAdapterFieldsAreAlwaysReported() throws {
         let lm = try loadedEngine()
         _ = lm.generate(system: nil, history: [], user: longPrompt,
-                        maxTokens: 4, temperature: 0.1, cacheable: false, adapterPath: nil)
+                        maxTokens: 4, temperature: 0.1, adapterPath: nil)
 
         let m = try XCTUnwrap(lm.lastTurnMetrics)
         XCTAssertEqual(m.adapterName, "none")
@@ -124,7 +124,7 @@ final class PrefillThroughputProbe: XCTestCase {
         ProcessInfo.processInfo.environment["PROBE_BACKEND"] == "gpu" ? SLMBackend.gpu : SLMBackend.cpu
 
     /// Long enough that the prompt pass dominates and a per-token fallback path is
-    /// obvious. ~350+ tokens, comfortably inside the 1024-token per-slot budget.
+    /// obvious. ~350+ tokens, comfortably inside the 1024-token budget.
     private let prompt = String(
         repeating: "The quick brown fox jumps over the lazy dog near the wide river bank. ",
         count: 40)
@@ -151,8 +151,7 @@ final class PrefillThroughputProbe: XCTestCase {
                               cacheDir: nil, loraPath: adapter) else { continue }
                 // Greedy, so the printed reply doubles as an output-parity check.
                 let reply = lm.generate(system: nil, history: [], user: prompt,
-                                        maxTokens: 24, temperature: 0,
-                                        cacheable: false, adapterPath: nil) ?? ""
+                                        maxTokens: 24, temperature: 0, adapterPath: nil) ?? ""
                 guard let m = lm.lastTurnMetrics else { continue }
                 let ratio = m.decodeTokensPerSecond > 0
                     ? m.prefillTokensPerSecond / m.decodeTokensPerSecond : 0
@@ -165,16 +164,16 @@ final class PrefillThroughputProbe: XCTestCase {
     }
 }
 
-/// Proves the prefix-reuse switch does what the log claims: with it off, a repeated
-/// prompt must re-evaluate every token, so `prefill tok/s` is a true throughput
-/// figure rather than a rate over whatever the cache happened to leave.
-final class PrefixReuseSwitchTests: XCTestCase {
+/// The KV cache is cleared at the start of every call, so nothing from one
+/// generation can leak into the next: a repeated greedy prompt must produce the
+/// same reply, and the same prompt token count, every time.
+final class KVCacheClearTests: XCTestCase {
 
     private let prompt = String(
         repeating: "The quick brown fox jumps over the lazy dog near the wide river bank. ",
         count: 20)
 
-    private func engine() throws -> ChatLM {
+    func testRepeatedGreedyCallIsIdentical() throws {
         guard let name = ModelCatalog.taskModels.first(where: { $0.isAvailable })?.resourceName,
               let path = ResourceLookup.path(name, ext: "gguf") else {
             throw XCTSkip("No .gguf in the bundle.")
@@ -183,43 +182,13 @@ final class PrefixReuseSwitchTests: XCTestCase {
         guard lm.load(modelPath: path, backend: SLMBackend.cpu, cacheDir: nil, loraPath: nil) else {
             throw XCTSkip("load failed: \(lm.lastError)")
         }
-        return lm
-    }
-
-    /// `cacheable: true` so the call is eligible for a slot — that is the only
-    /// configuration where reuse could kick in, and therefore the only one where
-    /// disabling it proves anything.
-    private func run(_ lm: ChatLM) -> ChatLMTurnMetrics? {
-        _ = lm.generate(system: nil, history: [], user: prompt,
-                        maxTokens: 4, temperature: 0.1, cacheable: true, adapterPath: nil)
-        return lm.lastTurnMetrics
-    }
-
-    func testReuseOnSecondCallSkipsMostOfThePrompt() throws {
-        let lm = try engine()
-        lm.prefixReuseEnabled = true
-        _ = run(lm)                                  // populate the slot
-        let second = try XCTUnwrap(run(lm))          // identical prompt
-        XCTAssertGreaterThan(second.cachedPrefixTokenCount, 0,
-                             "an identical repeated prompt should hit the cache")
-        XCTAssertLessThan(second.prefillTokenCount, second.promptTokenCount / 2,
-                          "most of the prompt should have been served from cache")
-    }
-
-    func testReuseOffReEvaluatesEveryToken() throws {
-        let lm = try engine()
-        lm.prefixReuseEnabled = false
-        _ = run(lm)
-        let second = try XCTUnwrap(run(lm))
-        XCTAssertEqual(second.cachedPrefixTokenCount, 0, "nothing may be reused")
-        XCTAssertEqual(second.prefillTokenCount, second.promptTokenCount,
-                       "every prompt token must be evaluated")
-        // The match is still REPORTED — that's the point of measuring this way:
-        // one run gives both the raw rate and the hit rate you gave up to get it.
-        XCTAssertGreaterThan(second.prefixMatchTokenCount, 0,
-                             "the match that WOULD have been reused should still be reported")
-        print(String(format: "RAWPREFILL %d tok in %.3fs = %.1f tok/s (reuse off, would have reused %d)",
-                     second.prefillTokenCount, second.prefillSeconds,
-                     second.prefillTokensPerSecond, second.prefixMatchTokenCount))
+        let first = lm.generate(system: nil, history: [], user: prompt,
+                                maxTokens: 16, temperature: 0, adapterPath: nil)
+        let firstIn = try XCTUnwrap(lm.lastTurnMetrics).promptTokenCount
+        let second = lm.generate(system: nil, history: [], user: prompt,
+                                 maxTokens: 16, temperature: 0, adapterPath: nil)
+        let secondIn = try XCTUnwrap(lm.lastTurnMetrics).promptTokenCount
+        XCTAssertEqual(first, second, "a cleared cache must make greedy output repeatable")
+        XCTAssertEqual(firstIn, secondIn)
     }
 }

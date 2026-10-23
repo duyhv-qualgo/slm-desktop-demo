@@ -102,7 +102,7 @@ struct BenchmarkConfig {
     /// exactly `maxTokens` tokens and ignore EOS, so every model does identical
     /// work. 512 in + 512 forced out is why benchmark loads get a 2048-token
     /// single-sequence context (`kBenchmarkCtx` in ChatLM.mm) instead of the
-    /// app's 1024-token slots — the two must both fit in one sequence.
+    /// app's 1024-token context — the two must both fit in one sequence.
     ///
     /// One caveat on determinism: temperature is 0.1, not 0. Temperature 0
     /// selects LiteRT-LM's greedy sampler, which fails in this build —

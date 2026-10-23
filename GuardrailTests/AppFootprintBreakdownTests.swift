@@ -50,7 +50,7 @@ final class AppFootprintBreakdownTests: XCTestCase {
                                        maxTokens: 24, temperature: 0, adapterPath: pack)
             }
         }
-        // Just under ChatLM's 1024-token per-slot prompt budget (kCtxPerSlot) —
+        // Just under ChatLM's 1024-token prompt budget (kCtx) —
         // a longer prompt is refused before it reaches llama.cpp.
         await step("chat model, long prompt (~900 tokens)") {
             let history = String(repeating: "Friend: Are we still on for dinner on Saturday at the new phở place? ", count: 55)

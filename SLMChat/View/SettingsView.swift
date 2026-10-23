@@ -47,14 +47,6 @@ struct SettingsView: View {
     /// published value, writes through `setNativeLanguage` (which persists +
     /// updates the shared service). Async because changing language reloads the
     /// task engine when the two languages have different LoRA packs installed.
-    /// Diagnostic switch — see `ConversationStore.setPrefixReuse`. Takes effect on
-    /// the next generation; no reload, so a measurement can be started and stopped
-    /// without disturbing anything else.
-    private var prefixReuseBinding: Binding<Bool> {
-        Binding(get: { store.prefixReuseEnabled },
-                set: { store.setPrefixReuse($0) })
-    }
-
     private var languageBinding: Binding<TranslateLanguage> {
         Binding(get: { store.nativeLanguage },
                 set: { lang in Task { await store.setNativeLanguage(lang) } })
@@ -285,18 +277,6 @@ struct SettingsView: View {
                     Text(backendFooter)
                 }
 
-                Section {
-                    Toggle("Reuse cached prompt prefix", isOn: prefixReuseBinding)
-                } header: {
-                    Text("Diagnostics")
-                } footer: {
-                    Text("On (default), a generation skips the leading prompt tokens "
-                       + "an earlier call already computed — usually most of them. "
-                       + "Turn OFF to measure raw prefill: every call then pays a full "
-                       + "prompt pass, so the prefill tok/s in the logs becomes true "
-                       + "throughput instead of a per-evaluated-token rate. Slower, and "
-                       + "for measurement only.")
-                }
 
                 Section {
                     NavigationLink("Benchmark") { BenchmarkView(service: store.service) }

@@ -174,8 +174,9 @@ enum Prompts {
     /// A chat gains ~2 messages per suggest (your reply + theirs), so stride `s`
     /// re-anchors about every `s / 2` suggests and the window runs 8 … 8+s−1.
     /// Stride 2 therefore re-anchors on EVERY suggest. Chosen from measured
-    /// eval tokens in `SuggestKVHarnessTests`, not by reasoning — re-run that
-    /// sweep before changing it.
+    /// eval tokens in `SuggestKVHarnessTests`, which was removed along with KV
+    /// prefix reuse; the stride is kept so prompts stay unchanged. Without
+    /// reuse it no longer affects latency.
     ///
     /// Measured 2026-09-23 (20 suggests, gemma / qwen2.5 / qwen3, pre-warm on):
     /// stride 3 ties 5 and 6 for the lowest suggest-time eval (steady turns max
@@ -637,25 +638,6 @@ enum Prompts {
         Conversation:
         \(renderHandles(history, friendName: friendName, window: window, stride: stride))
         """
-    }
-
-    /// The part of the NEXT `suggestReplies` prompt that is already known the
-    /// moment the user sends a message: everything up to and including the
-    /// `<Friend>: ` handle of the reply that hasn't arrived yet.
-    ///
-    /// Built by rendering the real prompt with an empty placeholder reply, so the
-    /// window is computed for `history.count + 1` messages — the window the next
-    /// suggest will actually use, which is what makes a re-anchor pre-warmable.
-    /// The text ends mid-line; `ChatLM.prefill` keeps only the tokens that are
-    /// stable whatever follows, so the boundary can't poison the cache.
-    static func suggestPrewarmPrefix(history: [ChatMessage],
-                                     friendName: String = friendName,
-                                     language: TranslateLanguage,
-                                     window: Int = suggestWindow,
-                                     stride: Int = suggestStride) -> String {
-        suggestReplies(history: history + [ChatMessage(sender: .friend, text: "")],
-                       friendName: friendName, language: language,
-                       window: window, stride: stride)
     }
 
     /// Render the recent history as finetune-format `<Handle>: text` lines — the

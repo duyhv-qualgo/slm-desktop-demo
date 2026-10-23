@@ -28,7 +28,7 @@ final class BenchmarkPromptTests: XCTestCase {
             // so the chat template wraps this one user turn. Measure the delta by
             // running it and reading the engine's own prompt token count.
             _ = lm.generate(system: nil, history: [], user: BenchmarkHarness.fixedPrompt,
-                            maxTokens: 1, temperature: 0.1, cacheable: false, adapterPath: nil)
+                            maxTokens: 1, temperature: 0.1, adapterPath: nil)
             let templated = lm.lastTurnMetrics?.promptTokenCount ?? -1
 
             print("BMPROMPT [\(option.id)] raw=\(raw) tok | after chat template=\(templated) tok")
@@ -52,7 +52,7 @@ final class BenchmarkPromptTests: XCTestCase {
 /// 512-token FORCED decode (EOS ignored) has to fit one sequence.
 ///
 /// This is the case that motivated `kBenchmarkCtx`. Under the app's 1024-token
-/// slots, 512 + 512 lands exactly on the ceiling — which would corrupt a
+/// context, 512 + 512 lands exactly on the ceiling — which would corrupt a
 /// benchmark rather than fail it, since the harness reports whatever it got.
 final class BenchmarkCapacityTests: XCTestCase {
 
@@ -87,7 +87,7 @@ final class BenchmarkCapacityTests: XCTestCase {
         // and they disagreed for as long as only one of them had the prefill-timer
         // fix.
         let bi = try XCTUnwrap(info)
-        XCTAssertEqual(bi.prefillTokenCount, m.prefillTokenCount)
+        XCTAssertEqual(bi.prefillTokenCount, m.promptTokenCount)
         XCTAssertEqual(bi.prefillTokensPerSecond, m.prefillTokensPerSecond, accuracy: 0.5,
                        "benchmark and per-turn prefill rates must match")
         XCTAssertLessThan(bi.prefillTokensPerSecond, 100_000,
@@ -115,17 +115,15 @@ final class PrefillLengthSweepTests: XCTestCase {
             guard lm.load(modelPath: path, backend: SLMBackend.cpu, cacheDir: nil, loraPath: nil)
             else { continue }
             any = true
-            lm.prefixReuseEnabled = false   // every run pays a full prompt pass
 
             let unit = "The quick brown fox jumps over the lazy dog near the river bank. "
-            for reps in [1, 4, 10, 20, 40, 70] {   // 70 keeps us under kCtxPerSlot
+            for reps in [1, 4, 10, 20, 40, 70] {   // 70 keeps us under kCtx
                 let prompt = String(repeating: unit, count: reps)
                 _ = lm.generate(system: nil, history: [], user: prompt,
-                                maxTokens: 2, temperature: 0.1,
-                                cacheable: false, adapterPath: nil)
+                                maxTokens: 2, temperature: 0.1, adapterPath: nil)
                 guard let m = lm.lastTurnMetrics else { continue }
                 print(String(format: "SWEEP [%@] in=%4d tok  prefill %.3fs  %7.1f tok/s",
-                             option.id, m.prefillTokenCount, m.prefillSeconds,
+                             option.id, m.promptTokenCount, m.prefillSeconds,
                              m.prefillTokensPerSecond))
             }
         }

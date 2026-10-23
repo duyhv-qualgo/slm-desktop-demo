@@ -17,23 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
 @interface ChatLMTurnMetrics : NSObject
 /// Tokens fed to the model: the whole rendered conversation (system + history +
 /// user turn after the chat template), NOT just the user's message.
+/// Every call evaluates all of them: the KV cache is cleared per call.
 @property (nonatomic, readonly) int    promptTokenCount;
-/// Leading prompt tokens served from the KV cache because the previous call
-/// began with the same tokens — they cost nothing this turn. See the
-/// prefix-reuse note in ChatLM.mm.
-@property (nonatomic, readonly) int    cachedPrefixTokenCount;
-/// Longest prefix found in ANY eligible slot, whether or not it was used — a
-/// match below the reuse threshold is reported here and not in
-/// `cachedPrefixTokenCount`, so "found nothing" stays distinguishable from
-/// "found too little to bother with".
-@property (nonatomic, readonly) int    prefixMatchTokenCount;
-/// Which KV slot (llama sequence) served this call. Features land in different
-/// slots so they stop evicting each other's cached prompt; seeing a feature hop
-/// between slots means it was pushed out by pressure from the others.
-@property (nonatomic, readonly) int    cacheSlotIndex;
-/// Prompt tokens actually evaluated: `promptTokenCount - cachedPrefixTokenCount`.
-/// This is what `prefillSeconds` was spent on.
-@property (nonatomic, readonly) int    prefillTokenCount;
 /// Time inside llama_decode for the prompt pass (the batched prefill).
 @property (nonatomic, readonly) double prefillSeconds;
 @property (nonatomic, readonly) double prefillTokensPerSecond;
@@ -139,14 +124,9 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
 /// This is the engine's DEFAULT adapter: the one every generation uses unless it
 /// names another via `generate…adapterPath:`.
 ///
-/// It used to be the only one. `llama_set_adapters_lora` operates on the CONTEXT,
-/// so swapping an adapter invalidates cached prompt prefixes — and llama.cpp does
-/// not clear them for you, so stale K/V computed under the previous adapter would
-/// silently be reused and produce wrong (but fluent) output. The fix was to
-/// forbid swapping. It is now to make the cache adapter-aware: each slot records
-/// which adapter produced its K/V and is never reused across a different one. So
-/// per-call adapters are safe, and the failure mode that motivated the old rule
-/// is structurally impossible rather than merely avoided.
+/// Per-call adapters are safe because the KV cache is cleared at the start of
+/// every generation: no K/V computed under one adapter is ever read under
+/// another.
 ///
 /// A `loraPath` that fails to load is NOT fatal — the model stays usable on its
 /// bare weights and `-activeLoRAPath` reports nil. Read that rather than
@@ -187,20 +167,13 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
 /// @{@"role": @"user"|@"model", @"text": @"..."} dicts. `onChunk` fires per
 /// token on the calling thread; the final call has done=YES. Blocks until
 /// generation completes.
-///
-/// `cacheable` describes the PROMPT, not the output: YES when this feature
-/// re-sends a nearly identical prompt each turn (auto-suggest, chat replies), so
-/// its KV prefix is worth keeping in a slot of its own. Pass NO for a prompt
-/// built around one message and never repeated (event detection, guardrail,
-/// translation) — those share one scratch slot instead of evicting the others.
 - (void)streamSystem:(nullable NSString *)system
              history:(NSArray<NSDictionary<NSString *, NSString *> *> *)history
                 user:(NSString *)user
            maxTokens:(int)maxTokens
          temperature:(float)temperature
-           cacheable:(BOOL)cacheable
              onChunk:(void (^)(NSString *chunk, BOOL done))onChunk
-    NS_SWIFT_NAME(stream(system:history:user:maxTokens:temperature:cacheable:onChunk:));
+    NS_SWIFT_NAME(stream(system:history:user:maxTokens:temperature:onChunk:));
 
 /// Streaming generation that also returns the runtime's own metrics for the
 /// turn. Identical to `-stream…` otherwise. Returns nil if the engine wasn't
@@ -214,7 +187,6 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
     NS_SWIFT_NAME(benchmarkStream(system:history:user:maxTokens:temperature:onChunk:));
 
 /// Blocking multi-turn generation. Returns the full reply, or nil on error.
-/// See `-stream…` for what `cacheable` means.
 ///
 /// `adapterPath` selects the LoRA adapter for THIS call; nil means the one the
 /// engine was loaded with, which is what every feature except auto-suggest wants.
@@ -222,12 +194,8 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
 /// in, so its replies are written by a model adapted to that language while
 /// translate / summarize / event stay on the user's own.
 ///
-/// Switching is cheap and safe. Cheap: adapters are parsed once and cached, and
-/// `llama_set_adapters_lora` no-ops when the set already matches. Safe: each KV
-/// slot records the adapter its cached prefix was computed under and is never
-/// reused across a different one — identical tokens do not mean identical cache
-/// contents once the weights change. The cost of alternating adapters is a
-/// re-prefill in the affected slot, never a wrong answer.
+/// Switching is cheap: adapters are parsed once and cached, and
+/// `llama_set_adapters_lora` no-ops when the set already matches.
 ///
 /// An adapter that fails to load degrades to the bare base for that call rather
 /// than failing it, exactly as the load-time `loraPath:` does.
@@ -236,43 +204,22 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
                                  user:(NSString *)user
                             maxTokens:(int)maxTokens
                           temperature:(float)temperature
-                            cacheable:(BOOL)cacheable
                           adapterPath:(nullable NSString *)adapterPath
-    NS_SWIFT_NAME(generate(system:history:user:maxTokens:temperature:cacheable:adapterPath:));
+    NS_SWIFT_NAME(generate(system:history:user:maxTokens:temperature:adapterPath:));
 
 /// Load a language pack into this engine without making it current, so the one
 /// expensive part of adapter switching — parsing the `.gguf` — happens off the
 /// critical path instead of inside the generation that first asks for it.
 ///
-/// A no-op for a pack already loaded, and it disturbs neither the KV cache nor
-/// the adapter currently in force. Safe to call speculatively.
+/// A no-op for a pack already loaded, and it does not change the adapter
+/// currently in force. Safe to call speculatively.
 - (void)prewarmAdapterAtPath:(NSString *)path
     NS_SWIFT_NAME(prewarmAdapter(path:));
-
-/// Evaluate the stable part of a prompt into a cacheable KV slot WITHOUT
-/// generating, so a later `generate…` whose prompt starts the same way only pays
-/// for what follows. Used to pre-warm the next auto-suggest the moment the user
-/// sends, while the reply is still in flight.
-///
-/// `user` may end mid-line. Only the tokens that stay identical whatever text
-/// is appended are kept (the chat template's tail is dropped), so the cached
-/// prefix is always a true prefix of the eventual prompt. Slot choice is the
-/// same longest-prefix/LRU rule generation uses: a pure extension lands in the
-/// slot it extends, a re-anchored window in the least-recently-used one.
-///
-/// Returns the number of tokens now cached for this prefix, or -1 if nothing
-/// was done (not loaded, benchmark mode, prefix too short, decode failed).
-/// `lastTurnMetrics` describes the pass (`stopReason` = `prefill`).
-- (int)prefillSystem:(nullable NSString *)system
-             history:(NSArray<NSDictionary<NSString *, NSString *> *> *)history
-                user:(NSString *)user
-         adapterPath:(nullable NSString *)adapterPath
-    NS_SWIFT_NAME(prefill(system:history:user:adapterPath:));
 
 /// Tokens available to ONE generation: prompt plus everything it generates must
 /// fit inside this. Exposed so callers size their prompts from the engine's real
 /// budget instead of duplicating the number and letting it drift.
-+ (int)contextTokensPerSlot NS_SWIFT_NAME(contextTokensPerSlot());
++ (int)contextTokens NS_SWIFT_NAME(contextTokens());
 
 /// Token count of `text` as this model's vocabulary sees it, with no chat
 /// template applied — the raw cost of a string.
@@ -283,20 +230,6 @@ typedef NS_ENUM(NSInteger, ChatLMActivationType) {
 /// bracket sequences like `[[INTENT]]` both tokenize far worse than plain ASCII).
 /// Returns 0 before a model is loaded.
 - (int)tokenCountOf:(NSString *)text NS_SWIFT_NAME(tokenCount(of:));
-
-/// Whether a generation may reuse the KV prefix a previous call left in a slot.
-///
-/// YES (default) is the shipping behaviour: consecutive auto-suggests in one chat
-/// share most of their prompt, and reusing that prefix is the difference between
-/// evaluating 30 tokens and 250.
-///
-/// Set NO to measure RAW prefill — every call then pays a full prompt pass, which
-/// is the only way to read a true tok/s figure. With reuse on, the rate reported
-/// in `[SLMPerf]` is per EVALUATED token, so a well-cached turn reports a handful
-/// of tokens and a near-zero time, telling you nothing about the engine's actual
-/// throughput. Turning this off does not change what the model sees or produces —
-/// only how much of the prompt is recomputed.
-@property (nonatomic) BOOL prefixReuseEnabled;
 
 /// Threads for the PROMPT pass (llama.cpp `n_threads_batch`). Decode keeps the
 /// P-core count: batch-1 decode is memory-bound and gains nothing from E-cores.

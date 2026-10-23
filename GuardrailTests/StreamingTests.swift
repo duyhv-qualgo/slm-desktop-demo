@@ -38,7 +38,7 @@ final class SummaryStreamShapeTests: XCTestCase {
             var renderedPartials = 0
             var firstRenderAtChars = -1
             lm.stream(system: nil, history: [], user: prompt,
-                      maxTokens: 96, temperature: 0.3, cacheable: false) { chunk, _ in
+                      maxTokens: 96, temperature: 0.3) { chunk, _ in
                 guard !chunk.isEmpty else { return }
                 buffer += chunk
                 if Prompts.partialSummary(from: buffer) != nil {
@@ -167,7 +167,7 @@ final class TranslateStreamTests: XCTestCase {
         var buffer = ""
         var partials: [String] = []
         lm.stream(system: nil, history: [], user: prompt,
-                  maxTokens: 160, temperature: 0.2, cacheable: false) { piece, _ in
+                  maxTokens: 160, temperature: 0.2) { piece, _ in
             guard !piece.isEmpty else { return }
             buffer += piece
             if let p = Prompts.partialTranslation(from: buffer) { partials.append(p) }
@@ -363,7 +363,7 @@ final class SummaryCompletenessTests: XCTestCase {
     }
 }
 
-/// A conversation long enough to exceed one slot must still summarize.
+/// A conversation long enough to exceed the context must still summarize.
 ///
 /// Regression test for a real failure: an accumulated backlog rendered a
 /// 1385-token prompt, the engine refused it (correctly — it will not overrun its
@@ -382,7 +382,7 @@ final class ConversationChunkingTests: XCTestCase {
         return svc
     }
 
-    /// ~60 messages of real length — comfortably past a single 1024-token slot.
+    /// ~60 messages of real length — comfortably past the 1024-token context.
     private func backlog() -> [ChatMessage] {
         (0..<60).map { i in
             ChatMessage(sender: i % 3 == 0 ? .you : .friend,
@@ -398,8 +398,8 @@ final class ConversationChunkingTests: XCTestCase {
         let msgs = backlog()
         let whole = Prompts.summarize(msgs, friendName: "Alex", native: .english)
         let wholeTokens = svc.taskEngine.tokenCount(of: whole) ?? 0
-        XCTAssertGreaterThan(wholeTokens, Int(ChatLM.contextTokensPerSlot()),
-                             "fixture must exceed one slot to exercise chunking")
+        XCTAssertGreaterThan(wholeTokens, Int(ChatLM.contextTokens()),
+                             "fixture must exceed the context to exercise chunking")
 
         var mapping: [(Int, Int)] = []
         var texts: [String] = []

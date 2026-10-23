@@ -34,66 +34,18 @@
 
 namespace {
 
-// --- KV cache slots ---------------------------------------------------------
-// The engine is shared by every feature (suggest / event / guard / translate /
-// summarize), and a single KV cache holds exactly ONE prompt prefix — so with
-// one cache the features evict each other: an event-detection call between two
-// auto-suggests throws away the suggest prefix and the next suggest re-prefills
-// from scratch, which is most of its latency.
-//
-// So the context carries several independent sequences ("slots"), each caching
-// its own prompt, and every call goes to the slot whose cached prompt shares the
-// longest prefix with it. This is the same design as llama.cpp's server, where
-// one slot = one llama sequence = one conversation.
-//
-// Cost: llama_context_params.n_ctx is the TOTAL across sequences (the per-
-// sequence share is llama_n_ctx_seq), so N slots need N × the per-slot budget of
-// KV cache. Only the KV cache grows — the compute buffer is sized by n_ubatch,
-// which is unchanged.
-constexpr int kSlotCount  = 3;     // 2 cacheable + 1 scratch (see below)
-constexpr int kCtxPerSlot = 1024;  // per-slot context, as before slots existed
+// --- KV cache -----------------------------------------------------------------
+// ONE llama sequence, cleared at the start of every generation. No prompt prefix
+// is carried between calls, so every call pays a full prefill — the price of a
+// cache with no reuse rules to get wrong (in particular, K/V computed under one
+// LoRA adapter can never be read under another).
+constexpr int kCtx = 1024;  // prompt + generated tokens for one call
 
-// The LAST slot is scratch: every call whose prompt won't recur goes there.
-//
-// Features split cleanly in two. Auto-suggest and chat replies re-send almost
-// the same prompt each turn, so caching them is worth real seconds. Event
-// detection, the guardrail and translation build a fresh prompt around one
-// message and never repeat it — caching them gains nothing, but letting them
-// take slots is actively harmful: two or three of them between suggests are
-// enough for LRU to evict the one prefix that mattered. Confining them to a
-// single shared scratch slot keeps the cacheable features undisturbed.
-constexpr int kScratchSlot = kSlotCount - 1;
-
-// Benchmark mode uses ONE sequence (see -runSystem:, which pins slot 0 and clears
-// it every run), so it trades the slots for a longer single context. The fixed
-// pass forces an exact decode length and ignores EOS, so prompt + output must
-// both fit: 512 in + 512 out needs more than the app's 1024-token slot, and
-// hitting that ceiling would corrupt a benchmark rather than fail it.
-//
-// This is CHEAPER than the app's layout, not more expensive — 2048 total against
-// 3 x 1024 — so the harness measures a model's memory honestly.
+// Benchmark mode trades for a longer context. The fixed pass forces an exact
+// decode length and ignores EOS, so prompt + output must both fit: 512 in + 512
+// out needs more than the app's 1024 tokens, and hitting that ceiling would
+// corrupt a benchmark rather than fail it.
 constexpr int kBenchmarkCtx = 2048;
-
-// A match this short isn't worth a slot claim — unrelated prompts still share a
-// BOS token and often a word or two. (No ratio test: a repeating feature owns
-// its slot, so even a small match there is free to take.)
-constexpr size_t kMinReuseTokens = 16;
-
-// One cached prompt + its last-use stamp. Index into the array IS the llama
-// sequence id.
-struct CacheSlot {
-    std::vector<llama_token> tokens;   // prompt currently cached in this sequence
-    uint64_t                 lastUsed = 0;
-    // Which LoRA adapter these K/V values were computed under ("" = bare
-    // weights). Adapters can now differ BETWEEN calls (auto-suggest runs under
-    // the conversation's language pack while translate/summarize/event run under
-    // the user's), and a cached prefix is only valid for the adapter that
-    // produced it: the K/V tensors bake in the adapted weights. Reusing a
-    // Vietnamese-adapted prefix under the Spanish adapter is silent corruption —
-    // it decodes fine and reads subtly wrong. Slots therefore match on (tokens,
-    // adapter), never tokens alone.
-    std::string              adapter;
-};
 
 // One-time global backend init (ggml/Metal registration).
 void EnsureBackend() {
@@ -165,10 +117,6 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
 // Per-turn timing/token breakdown recorded for EVERY generation (see ChatLM.h).
 @interface ChatLMTurnMetrics ()
 @property (nonatomic, readwrite) int    promptTokenCount;
-@property (nonatomic, readwrite) int    cachedPrefixTokenCount;
-@property (nonatomic, readwrite) int    prefixMatchTokenCount;
-@property (nonatomic, readwrite) int    cacheSlotIndex;
-@property (nonatomic, readwrite) int    prefillTokenCount;
 @property (nonatomic, readwrite) double prefillSeconds;
 @property (nonatomic, readwrite) double prefillTokensPerSecond;
 @property (nonatomic, readwrite) double timeToFirstTokenSeconds;
@@ -186,30 +134,15 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
 
 @implementation ChatLMTurnMetrics
 - (NSString *)summaryLine {
-    // "in=477 tok (cached 412, eval 65)" — the cached part costs nothing, so the
-    // prefill rate below is per EVALUATED token.
-    NSString *in;
-    if (_cachedPrefixTokenCount > 0) {
-        in = [NSString stringWithFormat:@"in=%d tok (cached %d, eval %d, slot %d)",
-              _promptTokenCount, _cachedPrefixTokenCount, _prefillTokenCount, _cacheSlotIndex];
-    } else if (_prefixMatchTokenCount > 0) {
-        // Distinguish "found nothing" from "found a match too small to use" —
-        // they look identical otherwise and mean very different things.
-        in = [NSString stringWithFormat:@"in=%d tok (no reuse, best match %d tok, slot %d)",
-              _promptTokenCount, _prefixMatchTokenCount, _cacheSlotIndex];
-    } else {
-        in = [NSString stringWithFormat:@"in=%d tok (cold, slot %d)",
-              _promptTokenCount, _cacheSlotIndex];
-    }
     // lora is always printed, in a fixed shape, even when nothing happened —
     // "lora=x/same +0.000s" is what makes the field greppable and averageable.
     // A line that omits the term when it is zero forces every consumer to handle
     // two formats and quietly under-counts the cold cases.
     return [NSString stringWithFormat:
-            @"%@ | prefill %.3fs (%.1f tok/s) | ttft %.3fs | "
+            @"in=%d tok | prefill %.3fs (%.1f tok/s) | ttft %.3fs | "
             @"out=%d tok (%d chars) | decode %.3fs (%.1f tok/s) | "
             @"lora=%@/%@ +%.3fs | overhead %.3fs | TOTAL %.3fs | stop=%@",
-            in, _prefillSeconds, _prefillTokensPerSecond,
+            _promptTokenCount, _prefillSeconds, _prefillTokensPerSecond,
             _timeToFirstTokenSeconds,
             _decodeTokenCount, _outputCharCount, _decodeSeconds, _decodeTokensPerSecond,
             _adapterName ?: @"none", _adapterState ?: @"?", _adapterSeconds,
@@ -247,10 +180,6 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     double             _lastTtftSeconds;   // wall time to first token of last run
     int                _lastDecodeCount;   // tokens actually emitted by last run
     ChatLMTurnMetrics *_lastTurnMetrics;   // full breakdown of the last run
-    // One cached prompt per llama sequence, so concurrent features don't evict
-    // each other. See the kSlotCount comment above and -pickSlotFor:reused:.
-    CacheSlot          _slots[kSlotCount];
-    uint64_t           _useCounter;        // monotonic stamp for LRU eviction
     llama_batch        _batch;             // reusable batch (capacity = n_batch)
     int                _batchCapacity;     // how many tokens _batch can hold
     bool               _batchAllocated;
@@ -266,8 +195,8 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     // adapter, and the map grows only with languages actually used.
     //
     // Swapping is legitimate BECAUSE it goes through llama_set_adapters_lora,
-    // which acts on the context and is honoured at graph-build time. The trap is
-    // the KV cache, not the weights: see CacheSlot::adapter.
+    // which acts on the context and is honoured at graph-build time, and because
+    // the KV cache is cleared per call, so no K/V outlives its adapter.
     std::unordered_map<std::string, llama_adapter_lora *> _adapters;
     NSString          *_defaultLoRAPath;   // adapter from the load; nil = bare
     NSString          *_activeLoRAPath;    // what the load actually got, nil = bare
@@ -298,9 +227,7 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
         _benchmark = false;
         _forcedDecodeTokens = 0;
         _lastTtftSeconds = 0;
-        _useCounter = 0;
         _batchAllocated = false;
-        _prefixReuseEnabled = YES;
         // Pin inference to the PERFORMANCE-core cluster only. Batch-1 decode is
         // memory-bound; spilling onto efficiency cores barely raises tok/s but
         // pushes CPU usage very high and wastes power/thermal. perflevel0 = the
@@ -453,13 +380,9 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     llama_context_params cp = llama_context_default_params();
     // Cap context to keep the KV cache small on 4 GB devices (iPhone XS). The
     // feature prompts chunk their input to stay well under this budget.
-    //
-    // n_ctx is the TOTAL across sequences, so the per-slot budget has to be
-    // multiplied by the slot count to leave each feature the same room it had
-    // when there was a single sequence (verified below via llama_n_ctx_seq).
     // Only the KV cache scales with this; the compute buffer follows n_ubatch.
-    cp.n_ctx           = enableBenchmark ? kBenchmarkCtx : kCtxPerSlot * kSlotCount;
-    cp.n_seq_max       = enableBenchmark ? 1 : kSlotCount;
+    cp.n_ctx           = enableBenchmark ? kBenchmarkCtx : kCtx;
+    cp.n_seq_max       = 1;
     // Split logical vs physical batch to bound the compute buffer. The ggml
     // scheduler reserves a worst-case graph sized by n_ubatch, whose dominant
     // term is the [n_ubatch × n_vocab] f32 logits tensor. With Gemma-3's 262k
@@ -467,14 +390,11 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     // ~130 MiB compute buffer; prefill just runs a few more passes, and decode
     // (1 token) is unaffected.
     //
-    // n_batch tracks the PER-SEQUENCE context, so a full prompt always fits one
-    // llama_decode call (split into ubatches internally). It must not be a
-    // separate literal: -decode:count: refuses anything over the batch capacity,
-    // so a batch smaller than the context would reject prompts the context
-    // happily allows, and a batch larger than the context wastes the allocation.
-    // (The old comment claimed "n_batch = n_ctx"; that stopped being true when
-    // n_ctx became the 3072-token total across slots.)
-    cp.n_batch         = (uint32_t)(enableBenchmark ? kBenchmarkCtx : kCtxPerSlot);
+    // n_batch = n_ctx, so a full prompt always fits one llama_decode call (split
+    // into ubatches internally). -decode:count: refuses anything over the batch
+    // capacity, so a batch smaller than the context would reject prompts the
+    // context happily allows.
+    cp.n_batch         = cp.n_ctx;
     cp.n_ubatch        = 128;
     cp.n_threads       = _nThreads;
     cp.n_threads_batch = _batchThreads > 0 ? _batchThreads : _nThreads;
@@ -510,22 +430,18 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
         _defaultLoRAPath = nil;
     }
 
-    // A batch big enough for a whole prompt pass, reused for every decode. Built
-    // by hand (not llama_batch_get_one) because that helper pins the sequence id
-    // to 0 — with slots, each call has to name its own sequence and positions.
+    // A batch big enough for a whole prompt pass, reused for every decode.
     _batch = llama_batch_init((int32_t)cp.n_batch, /*embd=*/0, /*n_seq_max=*/1);
     _batchCapacity  = (int)cp.n_batch;
     _batchAllocated = true;
 
-    // Don't trust the requested sizes — the header warns the context may differ
-    // from what was asked. A per-slot budget smaller than a feature's prompt
-    // would silently truncate conversations, so surface it.
-    const uint32_t ctxSeq = llama_n_ctx_seq(_ctx);
-    const int wantCtxSeq = _benchmark ? kBenchmarkCtx : kCtxPerSlot;
-    if ((int)ctxSeq < wantCtxSeq) {
-        NSLog(@"[ChatLM] per-slot context is %u tokens, expected %d — long prompts "
-              @"may not fit (n_ctx=%u, n_seq_max=%u)",
-              ctxSeq, wantCtxSeq, llama_n_ctx(_ctx), llama_n_seq_max(_ctx));
+    // Don't trust the requested size — the header warns the context may differ
+    // from what was asked. A budget smaller than a feature's prompt would
+    // silently truncate conversations, so surface it.
+    const uint32_t ctx = llama_n_ctx(_ctx);
+    if (ctx < cp.n_ctx) {
+        NSLog(@"[ChatLM] context is %u tokens, expected %u — long prompts may not fit",
+              ctx, cp.n_ctx);
     }
 
     _vocab = llama_model_get_vocab(_model);
@@ -568,7 +484,7 @@ static std::string NormalizeRole(NSString *role) {
 // Build the full conversation (system + history + latest user turn), render it
 // through the model's chat template, and tokenize. Mirrors the LiteRT-LM ChatLM's
 // multi-turn conversation construction.
-+ (int)contextTokensPerSlot { return kCtxPerSlot; }
++ (int)contextTokens { return kCtx; }
 
 - (int)tokenCountOf:(NSString *)text {
     if (!_vocab || text.length == 0) return 0;
@@ -683,8 +599,8 @@ static std::string NormalizeRole(NSString *role) {
 //
 // Cheap to call on every generation: llama_set_adapters_lora no-ops when the set
 // already matches, and the adapter itself is parsed once by -adapterAtPath:.
-// This does NOT touch the KV cache — that is -pickSlotFor:'s job, which refuses
-// to reuse a prefix computed under a different adapter.
+// This does NOT touch the KV cache — -runSystem: clears it before every call,
+// so no prefix computed under a different adapter is ever reused.
 - (BOOL)activateAdapterPath:(nullable NSString *)path {
     if (path.length == 0) {
         if (_currentLoRAPath == nil) return NO;
@@ -730,166 +646,18 @@ static std::string NormalizeRole(NSString *role) {
     [self adapterAtPath:path reason:@"prewarm"];
 }
 
-// Pick the KV slot to serve `prompt` from, and report how many of its leading
-// tokens are already cached there.
-//
-// Selection mirrors llama.cpp's server: score every slot by the length of the
-// prefix it shares with the new prompt and take the best. A weak match doesn't
-// count — claiming a slot for the sake of a handful of shared tokens would evict
-// a prefix worth hundreds. When nothing matches well, the least-recently-used
-// slot is taken and cleared, which is what keeps a stream of one-off prompts
-// (event detection, guardrail) from consuming every slot in turn.
-- (int)pickSlotFor:(const std::vector<llama_token> &)prompt
-           adapter:(const std::string &)adapter
-         cacheable:(bool)cacheable
-            reused:(size_t *)outReused
-             match:(size_t *)outMatch {
-    // Longest shared prefix per candidate slot. A one-shot prompt only ever
-    // looks at (and can only ever disturb) the scratch slot.
-    const int first = cacheable ? 0 : kScratchSlot;
-    const int last  = cacheable ? kScratchSlot - 1 : kScratchSlot;
-
-    int    bestSlot = first;
-    size_t bestLen  = 0;
-    for (int i = first; i <= last; ++i) {
-        // A slot whose K/V were computed under a different adapter scores zero:
-        // identical tokens do NOT mean identical cache contents once the weights
-        // differ. It stays eligible for LRU eviction below, so alternating
-        // adapters costs a re-prefill rather than a wrong answer.
-        if (_slots[i].adapter != adapter) continue;
-        const std::vector<llama_token> &cached = _slots[i].tokens;
-        const size_t limit = std::min(cached.size(), prompt.size());
-        size_t n = 0;
-        while (n < limit && cached[n] == prompt[n]) ++n;
-        if (n > bestLen) { bestLen = n; bestSlot = i; }
-    }
-    *outMatch = bestLen;   // reported even when unused, so the log can explain
-
-    if (bestLen >= kMinReuseTokens) {
-        // Never reuse the entire prompt: sampling needs logits, which only come
-        // from tokens actually passed through llama_decode.
-        *outReused = std::min(bestLen, prompt.size() - 1);
-        return bestSlot;
-    }
-
-    *outReused = 0;
-    if (!cacheable) return kScratchSlot;
-
-    int lru = first;
-    for (int i = first; i <= last; ++i) {
-        if (_slots[i].lastUsed < _slots[lru].lastUsed) lru = i;
-    }
-    return lru;
-}
-
-// Choose the slot for `prompt`, trim it to the reusable prefix, and record
-// `prompt` as its new contents. On return the slot holds exactly
-// prompt[0, *outReused) and the caller decodes the rest from that position.
-// Shared by -runSystem: and -prefillSystem: so a pre-warmed prefix is claimed
-// by exactly the rules the generation that consumes it will apply.
-- (int)claimSlotFor:(const std::vector<llama_token> &)prompt_tokens
-            adapter:(const std::string &)adapterKey
-          cacheable:(bool)cacheable
-             reused:(size_t *)outReused
-              match:(size_t *)outMatch {
-    llama_memory_t mem = llama_get_memory(_ctx);
-    size_t reused = 0, matched = 0;
-    int    slot   = 0;
-    if (_benchmark) {
-        // The harness repeats prompts on purpose; reuse would make later runs
-        // look free. Pin it to one slot and always start from an empty cache.
-        llama_memory_seq_rm(mem, /*seq_id=*/0, /*p0=*/-1, /*p1=*/-1);
-    } else if (!_prefixReuseEnabled) {
-        // Measurement mode: pick a slot as usual so the log still names one, then
-        // throw its contents away. Reporting `matched` is deliberate — it shows
-        // what reuse WOULD have salvaged, so one run gives both the raw rate and
-        // the hit rate you gave up to measure it.
-        slot = [self pickSlotFor:prompt_tokens adapter:adapterKey cacheable:cacheable
-                          reused:&reused match:&matched];
-        reused = 0;
-        llama_memory_seq_rm(mem, (llama_seq_id)slot, /*p0=*/-1, /*p1=*/-1);
-    } else {
-        slot = [self pickSlotFor:prompt_tokens adapter:adapterKey cacheable:cacheable
-                          reused:&reused match:&matched];
-        // A repeating feature that had a cached prompt but salvaged less than half
-        // of it means something upstream is rewriting the prompt's head — worth
-        // explaining rather than silently re-prefilling every turn.
-        if (cacheable && !_slots[slot].tokens.empty() &&
-            matched < prompt_tokens.size() / 2) {
-            [self logDivergenceFrom:_slots[slot].tokens new:prompt_tokens
-                                 at:matched slot:slot];
-        }
-    }
-    // Drop everything at or beyond the divergence point in THIS slot — the old
-    // tail plus the tokens the previous run generated there. Other slots are
-    // untouched, which is the whole point. seq_rm can refuse a partial removal
-    // (e.g. recurrent-state models); then the only safe state is an empty slot.
-    if (!llama_memory_seq_rm(mem, (llama_seq_id)slot, (llama_pos)reused, /*p1=*/-1)) {
-        // Logged because it is otherwise indistinguishable from "reuse is off":
-        // both show as a cold prefill. On a hybrid/recurrent model (qwen35) this
-        // fires on every reuse attempt — the app turns reuse off for those
-        // (ChatService.prefixReuseActive), so it only shows in direct ChatLM use.
-        NSLog(@"[ChatLM] seq_rm refused partial removal at %zu (slot %d) — slot "
-              @"cleared, %zu reusable tokens discarded", reused, slot, reused);
-        llama_memory_seq_rm(mem, (llama_seq_id)slot, /*p0=*/-1, /*p1=*/-1);
-        reused = 0;
-    }
-    // Record the prompt now: on any early exit the slot holds this prefix.
-    _slots[slot].tokens   = prompt_tokens;
-    _slots[slot].lastUsed = ++_useCounter;
-    _slots[slot].adapter  = adapterKey;
-    *outReused = reused;
-    *outMatch  = matched;
-    return slot;
-}
-
-// Detokenize a span for logging. Bounds-checked; returns "" past the end.
-- (NSString *)textOf:(const std::vector<llama_token> &)toks
-                from:(size_t)from
-               count:(size_t)count {
-    std::string out;
-    char piece[256];
-    for (size_t i = from; i < std::min(from + count, toks.size()); ++i) {
-        int n = llama_token_to_piece(_vocab, toks[i], piece, sizeof(piece), 0, /*special=*/true);
-        if (n > 0) out.append(piece, (size_t)n);
-    }
-    NSString *s = [NSString stringWithUTF8String:out.c_str()];
-    return s ?: @"";
-}
-
-// Explain a disappointing cache hit: print the text either side of the point
-// where the cached prompt and the new one stopped matching. Which text shows up
-// on the "cached"/"new" lines says immediately WHY the prefix broke — a changed
-// instruction, a history window that slid, a different chat. (llama.cpp's server
-// prints the same thing under its `slots_debug` flag.)
-- (void)logDivergenceFrom:(const std::vector<llama_token> &)cached
-                      new:(const std::vector<llama_token> &)fresh
-                       at:(size_t)matched
-                     slot:(int)slot {
-    const size_t back = matched > 6 ? 6 : matched;
-    NSLog(@"[ChatLM] cache prefix diverged at token %zu of %zu (slot %d)\n"
-          @"  common tail: …%@\n"
-          @"  cached next: %@…\n"
-          @"  new next   : %@…",
-          matched, fresh.size(), slot,
-          [self textOf:fresh from:matched - back count:back],
-          [self textOf:cached from:matched count:10],
-          [self textOf:fresh  from:matched count:10]);
-}
-
-// Decode `count` tokens into sequence `seq` starting at position `pos`, asking
-// for logits on the last one only (that's all the sampler reads).
+// Decode `count` tokens starting at position `pos`, asking for logits on the
+// last one only (that's all the sampler reads).
 - (bool)decode:(const llama_token *)tokens
          count:(int)count
-           seq:(int)seq
-        atPos:(llama_pos)pos {
+         atPos:(llama_pos)pos {
     // Refuse rather than overrun. _batch holds _batchCapacity tokens; writing
     // past it corrupts four heap allocations at once (token/pos/n_seq_id/logits)
     // and the process dies somewhere unrelated, with no hint of the cause. That
     // is not theoretical — a 1120-token prompt against a 1024 batch killed the
     // test runner silently while measuring prefill throughput.
     //
-    // Callers are supposed to keep prompts under kCtxPerSlot (Prompts chunks and
+    // Callers are supposed to keep prompts under kCtx (Prompts chunks and
     // windows for exactly this reason), so reaching here means an upstream bug.
     // Failing loudly is what makes that bug findable.
     if (count > _batchCapacity || count <= 0) {
@@ -903,24 +671,21 @@ static std::string NormalizeRole(NSString *role) {
         _batch.token[i]     = tokens[i];
         _batch.pos[i]       = pos + i;
         _batch.n_seq_id[i]  = 1;
-        _batch.seq_id[i][0] = (llama_seq_id)seq;
+        _batch.seq_id[i][0] = 0;
         _batch.logits[i]    = (i == count - 1);
     }
     return llama_decode(_ctx, _batch) == 0;
 }
 
-// Shared decode loop for both blocking and streaming generation. Logically
-// stateless per call — the conversation is rebuilt from scratch every time — but
-// the KV cache is REUSED across calls for whatever leading tokens are identical
-// (see the prefix-reuse block below), which is invisible to the caller and only
-// changes how long prefill takes.
+// Shared decode loop for both blocking and streaming generation. Stateless per
+// call: the conversation is rebuilt from scratch and the KV cache is cleared
+// every time.
 - (std::string)runSystem:(nullable NSString *)system
                  history:(NSArray<NSDictionary<NSString *, NSString *> *> *)history
                     user:(NSString *)user
                maxTokens:(int)maxTokens
                     temp:(float)temp
                ignoreEog:(bool)ignoreEog
-               cacheable:(bool)cacheable
              adapterPath:(nullable NSString *)adapterPath
                  onChunk:(void (^ _Nullable)(const std::string &, bool))onChunk {
     if (!_ctx) { _lastError = "engine not loaded"; if (onChunk) onChunk("", true); return ""; }
@@ -928,9 +693,8 @@ static std::string NormalizeRole(NSString *role) {
     // Put the requested adapter in force before anything is tokenized or decoded.
     // nil means "whatever the load asked for" — the overwhelmingly common case,
     // and the one every feature except auto-suggest takes. `applied` is the
-    // adapter that actually took, which is what the slot must be tagged with: a
-    // pack that failed to parse leaves the context bare, and tagging the slot
-    // with the requested path would let the next bare call reuse it.
+    // adapter that actually took: a pack that failed to parse leaves the context
+    // bare.
     NSString *wanted = adapterPath ?: _defaultLoRAPath;
     // Classify BEFORE switching — afterwards every state looks like "same".
     NSString *adapterState =
@@ -942,7 +706,6 @@ static std::string NormalizeRole(NSString *role) {
     const bool applied = [self activateAdapterPath:wanted];
     const double adapterSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - tAdapter0).count();
-    const std::string adapterKey = applied ? _currentLoRAPath.UTF8String : "";
     NSString *adapterName = applied ? _currentLoRAPath.lastPathComponent : @"none";
 
     llama_perf_context_reset(_ctx);   // metrics reflect only this run
@@ -961,21 +724,19 @@ static std::string NormalizeRole(NSString *role) {
     std::vector<llama_token> prompt_tokens = [self tokenizeSystem:system
                                                           history:history
                                                              user:user];
-    const int promptBudget = _benchmark ? kBenchmarkCtx : kCtxPerSlot;
+    const int promptBudget = _benchmark ? kBenchmarkCtx : kCtx;
     if (!prompt_tokens.empty() && (int)prompt_tokens.size() > promptBudget) {
         // Caught here rather than at -decode: so the message names the prompt,
         // not the batch. A prompt this long means Prompts' chunking or history
         // window let something through; truncating would hide that and produce
         // quietly wrong output instead.
-        NSLog(@"[ChatLM] prompt is %zu tokens, over the %d-token per-slot context "
+        NSLog(@"[ChatLM] prompt is %zu tokens, over the %d-token context "
               @"— refusing. Chunk or shorten it upstream.",
               prompt_tokens.size(), promptBudget);
         prompt_tokens.clear();
     }
     if (prompt_tokens.empty()) {
         _lastError = "tokenize failed or prompt too long";
-        llama_memory_clear(llama_get_memory(_ctx), /*data=*/true);
-        for (int i = 0; i < kSlotCount; ++i) { _slots[i].tokens.clear(); _slots[i].adapter.clear(); }
         ChatLMTurnMetrics *m = [[ChatLMTurnMetrics alloc] init];
         m.totalSeconds = m.overheadSeconds = elapsed();
         m.stopReason = @"error";
@@ -989,22 +750,8 @@ static std::string NormalizeRole(NSString *role) {
         return "";
     }
 
-    // --- KV prefix reuse -----------------------------------------------------
-    // Prefill dominates a turn here (a ~480-token suggest prompt costs seconds,
-    // the ~50-token answer far less), and consecutive calls overlap heavily: a
-    // second auto-suggest in the same chat repeats the whole instruction and all
-    // but the newest message. So instead of clearing the cache, keep the longest
-    // leading run of tokens identical to what's already in it and evaluate only
-    // the tail. Everything from the divergence point on is dropped, which also
-    // evicts the previous run's generated tokens (they sit after its prompt).
-    //
-    // This is purely a cache hit — the model sees exactly the same token sequence
-    // either way. Disabled under the benchmark harness, where a repeated prompt
-    // must pay full prefill or the numbers are meaningless.
-    llama_memory_t mem = llama_get_memory(_ctx);
-    size_t reused = 0, matched = 0;
-    const int slot = [self claimSlotFor:prompt_tokens adapter:adapterKey cacheable:cacheable
-                                 reused:&reused match:&matched];
+    // Start from an empty KV cache: the whole prompt is evaluated every call.
+    llama_memory_clear(llama_get_memory(_ctx), /*data=*/true);
 
     // Sampler chain: greedy when temp<=0, else top_k -> top_p -> temp -> dist.
     // top_k/top_p match the values the LiteRT-LM ChatLM used (40 / 0.95).
@@ -1023,11 +770,10 @@ static std::string NormalizeRole(NSString *role) {
     std::string pendingUTF8;   // bytes of a character not yet completed by a later token
     char piece[256];
     llama_token cur = 0;
-    // Evaluate only the uncached tail, continuing at the position where the
-    // reused prefix ends.
-    const llama_token *next = prompt_tokens.data() + reused;
-    int   nextCount         = (int)(prompt_tokens.size() - reused);
-    llama_pos nextPos       = (llama_pos)reused;
+    // The first pass evaluates the whole prompt from position 0.
+    const llama_token *next = prompt_tokens.data();
+    int   nextCount         = (int)prompt_tokens.size();
+    llama_pos nextPos       = 0;
     int generated = 0;
     bool firstToken = true;
     NSString *stopReason = @"max_tokens";
@@ -1041,21 +787,15 @@ static std::string NormalizeRole(NSString *role) {
     //
     // n_p_eval (the token COUNT) stays llama.cpp's; that one is always right.
     // Only the time is ours. The first loop iteration is the prompt pass by
-    // construction: nextCount is the uncached tail, and every later iteration
+    // construction: nextCount is the whole prompt, and every later iteration
     // sets it to 1.
     double prefillSeconds = 0;
     bool   firstPass = true;
     while (generated < maxTokens) {
         const auto tDecode0 = std::chrono::steady_clock::now();
-        if (![self decode:next count:nextCount seq:slot atPos:nextPos]) {
+        if (![self decode:next count:nextCount atPos:nextPos]) {
             _lastError = "llama_decode failed";
             stopReason = @"error";
-            // This slot's contents are no longer a known prefix of anything — drop
-            // it so the next call can't reuse a corrupt state. Other slots are
-            // unaffected by a failure here.
-            llama_memory_seq_rm(mem, (llama_seq_id)slot, /*p0=*/-1, /*p1=*/-1);
-            _slots[slot].tokens.clear();
-            _slots[slot].adapter.clear();
             break;
         }
         if (firstPass) {
@@ -1105,18 +845,10 @@ static std::string NormalizeRole(NSString *role) {
     m.adapterState            = adapterState;
     m.adapterSeconds          = adapterSeconds;
     m.promptTokenCount        = (int)prompt_tokens.size();
-    m.cachedPrefixTokenCount  = (int)reused;
-    m.prefixMatchTokenCount   = (int)matched;
-    m.cacheSlotIndex          = slot;
-    m.prefillTokenCount       = (int)(prompt_tokens.size() - reused);
     // Measured around the prompt pass ourselves — see `prefillSeconds` above for
-    // why llama's t_p_eval_ms isn't trusted. The rate is per EVALUATED token, so
-    // a cache hit doesn't flatter it.
+    // why llama's t_p_eval_ms isn't trusted.
     m.prefillSeconds          = prefillSeconds;
-    m.prefillTokensPerSecond  = prefillSeconds > 0 ? m.prefillTokenCount / prefillSeconds : 0;
-    // A one-token tail (nearly everything cached) still passes through here, so
-    // prefillSeconds is the cost of that single token rather than a batch — tiny,
-    // and `cached` in the log explains why.
+    m.prefillTokensPerSecond  = prefillSeconds > 0 ? m.promptTokenCount / prefillSeconds : 0;
     m.timeToFirstTokenSeconds = _lastTtftSeconds;
     m.decodeTokenCount        = generated;
     m.decodeSeconds           = d.t_eval_ms / 1000.0;
@@ -1137,10 +869,9 @@ static std::string NormalizeRole(NSString *role) {
                 user:(NSString *)user
            maxTokens:(int)maxTokens
          temperature:(float)temperature
-           cacheable:(BOOL)cacheable
              onChunk:(void (^)(NSString *, BOOL))onChunk {
     [self runSystem:system history:history user:user maxTokens:maxTokens temp:temperature
-          ignoreEog:false cacheable:cacheable adapterPath:nil
+          ignoreEog:false adapterPath:nil
             onChunk:^(const std::string &chunk, bool done) {
                 NSString *s = [NSString stringWithUTF8String:chunk.c_str()];
                 onChunk(s ?: @"", done ? YES : NO);
@@ -1161,7 +892,7 @@ static std::string NormalizeRole(NSString *role) {
     const int  cap    = forced ? _forcedDecodeTokens : maxTokens;
 
     [self runSystem:system history:history user:user maxTokens:cap temp:temperature
-          ignoreEog:forced cacheable:false adapterPath:nil
+          ignoreEog:forced adapterPath:nil
             onChunk:^(const std::string &chunk, bool done) {
                 NSString *s = [NSString stringWithUTF8String:chunk.c_str()];
                 onChunk(s ?: @"", done ? YES : NO);
@@ -1181,7 +912,7 @@ static std::string NormalizeRole(NSString *role) {
     ChatLMTurnMetrics *turn = _lastTurnMetrics;
     ChatLMBenchmarkInfo *info = [[ChatLMBenchmarkInfo alloc] init];
     info.timeToFirstTokenSeconds = _lastTtftSeconds;
-    info.prefillTokenCount       = turn ? turn.prefillTokenCount : d.n_p_eval;
+    info.prefillTokenCount       = turn ? turn.promptTokenCount : d.n_p_eval;
     info.prefillTokensPerSecond  = turn ? turn.prefillTokensPerSecond : 0;
     // decodeTokenCount is the number of tokens actually generated (matches the
     // forced-decode target). llama's n_eval is one lower — the first token comes
@@ -1197,78 +928,13 @@ static std::string NormalizeRole(NSString *role) {
                                  user:(NSString *)user
                             maxTokens:(int)maxTokens
                           temperature:(float)temperature
-                            cacheable:(BOOL)cacheable
                           adapterPath:(nullable NSString *)adapterPath {
     if (!_ctx) return nil;
     std::string out = [self runSystem:system history:history user:user
                             maxTokens:maxTokens temp:temperature ignoreEog:false
-                            cacheable:cacheable adapterPath:adapterPath onChunk:nil];
+                            adapterPath:adapterPath onChunk:nil];
     if (!_lastError.empty()) return nil;
     return [NSString stringWithUTF8String:out.c_str()];
-}
-
-- (int)prefillSystem:(nullable NSString *)system
-             history:(NSArray<NSDictionary<NSString *, NSString *> *> *)history
-                user:(NSString *)user
-         adapterPath:(nullable NSString *)adapterPath {
-    if (!_ctx || _benchmark) return -1;
-    _lastError.clear();
-    const auto t0 = std::chrono::steady_clock::now();
-
-    // Same adapter resolution as -runSystem:, so the slot is tagged with the
-    // adapter the consuming generation will look for.
-    NSString *wanted = adapterPath ?: _defaultLoRAPath;
-    const bool applied = [self activateAdapterPath:wanted];
-    const std::string adapterKey = applied ? _currentLoRAPath.UTF8String : "";
-
-    // `user` ends mid-line ("…\n<Friend>: "), and the chat template appends its
-    // own tail after it. Neither the template tail nor the last token or two of
-    // `user` is guaranteed to survive once the real message is appended — a BPE
-    // merge can swallow the trailing space. Tokenizing a second time with one
-    // extra character and keeping only the shared prefix leaves exactly the
-    // tokens that stay put whatever follows, without knowing the template.
-    std::vector<llama_token> a = [self tokenizeSystem:system history:history user:user];
-    std::vector<llama_token> b = [self tokenizeSystem:system history:history
-                                                 user:[user stringByAppendingString:@"x"]];
-    size_t n = 0;
-    while (n < a.size() && n < b.size() && a[n] == b[n]) ++n;
-    a.resize(n);
-    if (n < kMinReuseTokens || (int)n > kCtxPerSlot) return -1;
-
-    size_t reused = 0, matched = 0;
-    const int slot = [self claimSlotFor:a adapter:adapterKey cacheable:true
-                                 reused:&reused match:&matched];
-    const int count = (int)(n - reused);
-    double prefillSeconds = 0;
-    if (count > 0) {
-        const auto tDecode0 = std::chrono::steady_clock::now();
-        if (![self decode:a.data() + reused count:count seq:slot atPos:(llama_pos)reused]) {
-            _lastError = "llama_decode failed (prefill)";
-            llama_memory_seq_rm(llama_get_memory(_ctx), (llama_seq_id)slot, -1, -1);
-            _slots[slot].tokens.clear();
-            _slots[slot].adapter.clear();
-            return -1;
-        }
-        prefillSeconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - tDecode0).count();
-    }
-
-    ChatLMTurnMetrics *m = [[ChatLMTurnMetrics alloc] init];
-    m.adapterName            = applied ? _currentLoRAPath.lastPathComponent : @"none";
-    m.adapterState           = @"-";
-    m.promptTokenCount       = (int)n;
-    m.cachedPrefixTokenCount = (int)reused;
-    m.prefixMatchTokenCount  = (int)matched;
-    m.cacheSlotIndex         = slot;
-    m.prefillTokenCount      = count;
-    m.prefillSeconds         = prefillSeconds;
-    m.prefillTokensPerSecond = prefillSeconds > 0 ? count / prefillSeconds : 0;
-    m.totalSeconds           = std::chrono::duration<double>(
-                                   std::chrono::steady_clock::now() - t0).count();
-    m.overheadSeconds        = std::max(0.0, m.totalSeconds - prefillSeconds);
-    m.stopReason             = @"prefill";
-    _lastTurnMetrics = m;
-    return (int)n;
 }
 
 - (int)batchThreads { return _batchThreads > 0 ? _batchThreads : _nThreads; }

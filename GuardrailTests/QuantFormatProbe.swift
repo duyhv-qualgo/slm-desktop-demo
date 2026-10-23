@@ -102,9 +102,9 @@ final class QuantFormatProbe: XCTestCase {
         var prefill: [Double] = []
         for i in 0..<4 {
             _ = lm.generate(system: nil, history: [], user: prompt, maxTokens: 1,
-                            temperature: 0.1, cacheable: true, adapterPath: nil)
+                            temperature: 0.1, adapterPath: nil)
             guard let m = lm.lastTurnMetrics else { continue }
-            r.promptTokens = Int(m.prefillTokenCount)
+            r.promptTokens = Int(m.promptTokenCount)
             if i > 0 { prefill.append(m.prefillSeconds) }
         }
         guard !prefill.isEmpty else { return r }
@@ -113,7 +113,7 @@ final class QuantFormatProbe: XCTestCase {
         var runs: [Result] = []
         for _ in 0..<3 {
             let out = lm.generate(system: nil, history: [], user: prompt, maxTokens: 128,
-                                  temperature: 0.1, cacheable: true, adapterPath: nil) ?? "<nil>"
+                                  temperature: 0.1, adapterPath: nil) ?? "<nil>"
             guard let m = lm.lastTurnMetrics, m.decodeSeconds > 0 else { continue }
             var d = r
             d.output = out
@@ -168,7 +168,6 @@ final class QuantFormatProbe: XCTestCase {
                         XCTFail("\(model.name) \(format) asked for gpu, got \(lm.activeBackend)"); continue
                     }
                     let loadedMB = footprintMB() - base
-                    lm.prefixReuseEnabled = false
                     ran += 1
 
                     for (lang, prompt) in prompts {

@@ -73,25 +73,11 @@ final class AppFootprintBreakdownTests: XCTestCase {
         await step("language detector (first use)") {
             _ = LangDetect.shared.ranked("Can we move the meeting to Thursday?")
         }
-        let embedder = MessageEmbedder()
-        try await step("embedder load (EmbeddingGemma 2 text+vision, CPU)") {
-            try await embedder.load()
-        }
-        try await step("embedder: first text embedding") {
-            _ = try await embedder.embed(documents: ["Can we move the meeting to Thursday?"])
-        }
-        let photo = "/Library/User Pictures/Animals/Eagle.heic"
-        if let data = FileManager.default.contents(atPath: photo) {
-            try await step("embedder: first photo embedding (vision encoder)") {
-                _ = try await embedder.embed(image: data)
-            }
-        }
 
         print("\nFOOTPRINT | step                                                  delta      total")
         for (label, delta, total) in rows {
             print(String(format: "FOOTPRINT | %-52@ %+7.1f MB %7.1f MB", label as NSString, delta, total))
         }
-        await embedder.unload()
         await slm.unload()
     }
 }

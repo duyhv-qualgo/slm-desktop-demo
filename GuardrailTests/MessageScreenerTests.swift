@@ -18,7 +18,7 @@ final class MessageScreenerTests: XCTestCase {
     /// Records what ran, in order, without touching the real classifier — the
     /// scheduler's job is ordering, and a real verdict would only add noise.
     private func recordingScreener(_ log: @escaping (ChatMessage) -> Void)
-        -> MessageScreener {
+        -> MessageScreener<ChatMessage> {
         MessageScreener { message, _ in
             log(message)
             message.apply(.clean)          // mark done, as real screening would
@@ -78,7 +78,7 @@ final class MessageScreenerTests: XCTestCase {
     /// The queue stays bounded under a flick.
     func testQueueIsShedUnderAFlick() async throws {
         let msgs = messages(1_000)
-        let s = MessageScreener { _, _ in
+        let s = MessageScreener<ChatMessage> { _, _ in
             // Never completes quickly, so the queue builds while we scroll.
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
@@ -87,7 +87,7 @@ final class MessageScreenerTests: XCTestCase {
             s.viewportDidShow(index: i, in: msgs)
         }
 
-        XCTAssertLessThanOrEqual(s.pendingCount, MessageScreener.maxPending,
+        XCTAssertLessThanOrEqual(s.pendingCount, MessageScreening.maxPending,
                                  "queue reached \(s.pendingCount) — shedding is not working")
         XCTAssertGreaterThan(s.shed, 0, "a 800-row flick should have shed work")
     }

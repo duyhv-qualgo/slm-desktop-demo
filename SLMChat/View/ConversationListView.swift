@@ -434,10 +434,10 @@ private struct ConversationRowContent: View {
     }
 }
 
-/// "Messages" results under the chat list while searching: exact text matches
-/// first, then messages that match by meaning (on-device embeddings).
+/// "Messages" results under the chat list while searching: exact text matches,
+/// newest first.
 private struct MessageResultsSection: View {
-    @ObservedObject var search: MessageSearch
+    let search: MessageSearch
     let query: String
     let selectedID: UUID?
     let open: (MessageHit) -> Void
@@ -447,26 +447,18 @@ private struct MessageResultsSection: View {
 
     var body: some View {
         SectionHeader(title: "Messages", expanded: $expanded)
-            // Re-run as typing pauses, and as background indexing adds vectors.
-            .task(id: "\(query)|\(search.indexedCount)") {
+            // Re-run as typing pauses.
+            .task(id: query) {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard !Task.isCancelled else { return }
-                let found = await search.search(query)
-                if !Task.isCancelled { hits = found }
+                hits = search.search(query)
             }
         if expanded {
-            if search.isIndexing {
-                Label("Indexing \(search.indexedCount)/\(search.eligibleCount) messages…",
-                      systemImage: "sparkle.magnifyingglass")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(Theme.textSecondary)
-                    .padding(.horizontal, 12).padding(.bottom, 4)
-            }
             ForEach(hits) { hit in
                 MessageHitRow(hit: hit, query: query, selected: hit.id == selectedID) { open(hit) }
             }
             if hits.isEmpty {
-                Text(search.isAvailable ? "No messages found" : "No messages found · meaning search unavailable")
+                Text("No messages found")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textSecondary)
                     .padding(.horizontal, 22).padding(.vertical, 6)
@@ -493,15 +485,6 @@ private struct MessageHitRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(hit.chatTitle).font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                        if !hit.exact {
-                            Text(hit.viaPhoto ? "≈ in photo" : "≈ related")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(Theme.accent)
-                                .padding(.horizontal, 5).padding(.vertical, 1)
-                                .background(Theme.accent.opacity(0.14), in: Capsule())
-                                .help(hit.viaPhoto ? "Matched what's in the photo"
-                                                   : String(format: "Matched by meaning (similarity %.2f)", hit.score))
-                        }
                         Spacer(minLength: 4)
                         Text(DaySeparator.label(for: hit.message.date))
                             .font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
@@ -530,7 +513,7 @@ private struct MessageHitRow: View {
         .onHover { hovering = $0 }
     }
 
-    /// The message text, with the query in bold for exact matches. A message the
+    /// The message text, with the query in bold. A message the
     /// thread would blur shows its label instead, same as the inbox preview —
     /// search must not print what the guardrail hides.
     private var snippet: Text {
@@ -542,7 +525,7 @@ private struct MessageHitRow: View {
         var body = m.text.isEmpty ? (m.hasImage ? "📷 Photo" : m.fileName.map { "📄 \($0)" } ?? "") : m.text
         body = body.replacingOccurrences(of: "\n", with: " ")
         var attributed = AttributedString(who + body)
-        if hit.exact, let r = attributed.range(of: query, options: .caseInsensitive) {
+        if let r = attributed.range(of: query, options: .caseInsensitive) {
             attributed[r].font = .system(size: 12.5, weight: .bold)
             attributed[r].foregroundColor = .primary
         }

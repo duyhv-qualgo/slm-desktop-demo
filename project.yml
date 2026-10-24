@@ -7,9 +7,8 @@ options:
   groupSortPosition: top
 
 packages:
-  # LiteRT-LM: text + photo embeddings (EmbeddingGemma 2) for semantic search,
-  # and the TFLite runtime for the guardrail / tagger. Xcode downloads its
-  # prebuilt macOS dylib; see SLMChat/Engine/MessageEmbedder.swift.
+  # LiteRT-LM: provides the TFLite runtime for the guardrail / tagger (see
+  # SLMChat/TFLiteC.h). Xcode downloads its prebuilt macOS dylib.
   LiteRTLM:
     url: https://github.com/google-ai-edge/LiteRT-LM.git
     exactVersion: 0.18.0
@@ -86,9 +85,9 @@ targets:
       - framework: Frameworks/llama.xcframework
         embed: true
         sign: true
-      # LiteRT-LM: the embedder (MessageEmbedder) AND, as on iOS, the TFLite
-      # runtime for GuardLM / ImageTagLM — its dylib statically bundles TFLite
-      # and re-exports the classic C API (prototypes in TFLiteC.h). Bumping
-      # this version changes the guardrail's TFLite: re-run the parity tests.
+      # LiteRT-LM: as on iOS, the TFLite runtime for GuardLM / ImageTagLM — its
+      # dylib statically bundles TFLite and re-exports the classic C API
+      # (prototypes in TFLiteC.h). Bumping this version changes the guardrail's
+      # TFLite: re-run the parity tests.
       - package: LiteRTLM
         product: LiteRTLM

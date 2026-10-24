@@ -14,6 +14,12 @@ For anything performance-related — why a turn is slow, CPU vs GPU, device
 ceilings, which experiments are already settled — see
 **[PERFORMANCE.md](PERFORMANCE.md)**.
 
+**On the `integration` branch** the engine was trimmed for handover: one KV slot
+cleared per call (no prefix reuse), no benchmark tooling, four metrics fields,
+`cancel`, and an `SLMMessage` protocol in place of the demo's `ChatMessage`.
+**[integration.md](integration.md)** says which files to transfer and what is
+still open. This document is updated to match that branch.
+
 ---
 
 ## 1. Day 1 — getting it to build
@@ -147,7 +153,7 @@ View/                SwiftUI. Talks only to ConversationStore.
 Store/               ConversationStore — @MainActor ObservableObject, all app state.
 Engine/ChatService   Feature orchestration: which model, which prompt, which params.
 Engine/SLMEngine     Async wrapper serializing one ChatLM on its own queue.
-ChatLM.{h,mm}        Obj-C++ over llama.cpp's C API. KV cache slots, LoRA, sampling.
+ChatLM.{h,mm}        Obj-C++ over llama.cpp's C API. KV cache, LoRA, sampling, cancel.
 Frameworks/          Prebuilt llama.cpp + TFLite runtime.
 ```
 
@@ -205,8 +211,8 @@ Load (`ChatLM.mm:302`), once per model:
    `dispatch_once` in `EnsureBackend()`.
 2. **`llama_model_load_from_file`** — mmaps the weights. `mp.n_gpu_layers`
    decides CPU vs Metal; `mp.use_extra_bufts = false` is a RAM fix (§6).
-3. **`llama_init_from_model`** — allocates the context: `n_ctx = 1024 × 3`,
-   `n_seq_max = 3`, `n_ubatch = 128`.
+3. **`llama_init_from_model`** — allocates the context: `n_ctx = 1024`,
+   `n_seq_max = 1`, `n_ubatch = 128`.
 4. **LoRA adapter**, if one was requested — `llama_adapter_lora_init` then
    `llama_set_adapters_lora` (§5).
 
@@ -218,18 +224,20 @@ this**; the engine is logically stateless per call:
    **`llama_chat_apply_template`** renders them using the template *embedded in
    the .gguf* — so Gemma's `<start_of_turn>` and Qwen's ChatML both work without
    us knowing which. Then `llama_tokenize` → `vector<llama_token>`.
-6. **Pick a KV slot** → `pickSlotFor:` (`:540`), see §4.5.
+6. **Clear the KV cache** → `llama_memory_clear`, see §4.5.
 7. **Build the sampler chain** (`:716`). `temp <= 0` → greedy; otherwise
    `top_k(40)` → `top_p(0.95)` → `temp` → `dist`. (Greedy is the path that
    returns `nil` — see §6.)
-8. **Prefill** — one `llama_decode` over the whole uncached prompt at once.
+8. **Prefill** — one `llama_decode` over the whole prompt at once.
 9. **Decode loop** (`:738`), until `maxTokens` or end-of-generation:
    - `llama_sampler_sample(smpl, _ctx, -1)` → next token
    - `llama_vocab_is_eog(...)` → the model asked to stop
    - `llama_token_to_piece(...)` → that token's text, handed to `onChunk`
      (this is what makes streaming)
    - feed that one token back in and repeat
-10. **Metrics** from `llama_perf_context` into `ChatLMTurnMetrics` (`:778`).
+   - stop early if `-cancel` was called (checked every token, and during the
+     prefill through llama.cpp's abort callback)
+10. **Metrics** into `ChatLMTurnMetrics`: TTFT, decode tok/s, total, stop reason.
 
 Step 9 is the whole trick: **the model's own output becomes its next input.**
 That loop is the entire "AI" part.
@@ -249,79 +257,41 @@ optimization effort:
 **Prefill dominates.** A 480-token suggest prompt costs seconds; the 50-token
 reply costs far less. So: to make a feature faster, **shorten the prompt** — do
 not touch sampling params. This is also why the 3-second auto-suggest budget is
-a prompt-engineering problem, and why the KV cache below exists.
+a prompt-engineering problem.
 
 Read it off any turn in the log:
 
 ```
-in=477 tok (cached 412, eval 65, slot 0) | prefill 0.412s (157.8 tok/s) | ttft 0.600s |
-out=48 tok (196 chars) | decode 1.110s (43.2 tok/s) | overhead 0.050s | TOTAL 1.572s | stop=eos
+[SLMPerf] task/suggest qwen3.5-0.8b(gpu) | ttft 0.600s | decode 43.2 tok/s | TOTAL 1.572s | stop=eos | cap=160 temp=0.80
 ```
 
-`cached 412` means 412 tokens were free. `eval 65` is what actually cost prefill
-time.
+`ttft` is what the user waits before any text appears, and it is mostly prefill.
+`stop=max_tokens` on a feature means its replies are being cut off.
 
-### 4.5 The KV cache and why there are 3 slots
+### 4.5 The KV cache — one slot, cleared every call
 
 While generating, the model caches an intermediate result (the "K/V") for every
 token it has seen. That cache is what makes token #200 as cheap as token #2 —
 without it every step would reprocess the whole prompt.
 
-Consequence: **the cache holds exactly one prompt prefix at a time.** One shared
-context plus five features means they evict each other — an event-detection call
-between two auto-suggests destroys the suggest prefix, and the next suggest pays
-full prefill again.
+On the `integration` branch the context holds **one sequence of 1024 tokens**
+(prompt + reply), and `runSystem:` **clears it at the start of every call**. No
+prompt prefix is carried from one call to the next.
 
-So the context carries three independent *sequences* ("slots"), same design as
-llama.cpp's own server (`ChatLM.mm:36-69`):
+- **Cost:** every call pays a full prefill. A ~480-token suggest prompt that the
+  old design mostly served from cache is now evaluated whole, so suggestions are
+  slower than on `main`.
+- **What it buys:** there are no reuse rules to get wrong. In particular, K/V
+  computed under one LoRA adapter can never be read under another (§5), the KV
+  cache is a third of its old size (1024 tokens instead of 3 × 1024), and the
+  engine is about 600 lines shorter.
+- **If latency needs it back:** the multi-slot, longest-prefix design is on
+  `main` and `dev-q2-lora` (`pickSlotFor:` / `claimSlotFor:`, keyed by tokens
+  *and* adapter). Bring the adapter key with it, or §5's silent corruption
+  returns.
 
-- **Slots 0–1, cacheable** — auto-suggest and chat replies, which resend nearly
-  the same prompt every turn. Caching these is worth real seconds.
-- **Slot 2, scratch** — translate, summarize, event detection. These build a
-  fresh prompt around one message and never repeat it, so caching gains nothing
-   — but letting them take slots is *actively harmful*, since two or three of
-  them are enough to evict the one prefix that mattered. (The guardrail is not
-  in this list any more; it does not touch the SLM at all — §9.)
-
-A slot is keyed by **(tokens, adapter)**, not tokens alone. See §5 for why that
-field is load-bearing.
-
-**How a call declares which kind it is.** Swift callers never pass
-`cacheable:`. They pass a `label:` — an `SLMFeatureLabel` case — and the enum
-answers for itself:
-
-```swift
-var isCacheable: Bool {
-    switch self {
-    case .suggest, .stream, .complete: return true
-    case .summarize, .summarizeChunk, .translate, .translateQuery,
-         .event: return false
-    }
-}
-```
-
-This used to be a `Set<String>` of label names, and a new repeating feature added
-with a fresh string silently got no caching — no error, just seconds. The enum
-closes that: a new case **will not compile** until this switch handles it, which
-is the point. Answer honestly; claiming `true` for a one-shot feature costs
-another feature its slot. The label is also what appears in `[SLMPerf]`.
-
-Each call scores every candidate slot by longest shared prefix, keeps that
-prefix, and drops the rest with `llama_memory_seq_rm`. A match under 16 tokens
-doesn't count (unrelated prompts still share a BOS token).
-
-When a repeating feature salvages less than half its cached prompt, the engine
-logs the exact divergence point:
-
-```
-[ChatLM] cache prefix diverged at token 31 of 477 (slot 0)
-  common tail: …you are a helpful
-  cached next: assistant. Reply…
-  new next   : assistant, answer…
-```
-
-That almost always means something upstream is rewriting the prompt's *head* —
-a timestamp, a re-ordered instruction. Fix the prompt, get the seconds back.
+`SLMFeatureLabel` (the `label:` every Swift call passes) now only tags the
+`[SLMPerf]` line. It no longer decides anything about caching.
 
 ### 4.6 The Swift stack above it
 
@@ -347,11 +317,13 @@ call in `withCheckedContinuation`, so from Swift you write:
 ```swift
 let reply = await taskEngine.complete(system: sys, history: turns, user: text,
                                       maxTokens: 72, temperature: 0.5,
-                                      label: "reply")     // → String?
+                                      label: .suggest)    // → String?
 ```
 
 …and concurrent callers queue up instead of corrupting each other. **Never call
 `ChatLM` directly from Swift.** It is not thread-safe and nothing will stop you.
+The one exception is `SLMEngine.cancelCurrentGeneration()`, which deliberately
+skips the queue: the queue is blocked inside the very call it cancels.
 
 `ChatService` holds the per-feature params (`suggestTemp`, `translateTokens`, …)
 and picks the prompt. `ConversationStore` is `@MainActor` and owns everything the
@@ -360,12 +332,11 @@ UI observes.
 ### 4.7 Adding a feature — the actual recipe
 
 1. Add a prompt builder + output parser to `Engine/Prompts.swift`. **Ping me** —
-   this is the file coupled to the trained weights (§2).
+   this is the file coupled to the trained weights (§2). Builders take
+   `[any SLMMessage]`, so they work with the host app's own message type.
 2. Add token/temp constants to `ChatService.swift` next to the existing ones.
 3. Add a case to `SLMFeatureLabel` and pass it as `label:` — it tags your
-   `[SLMPerf]` lines and decides cacheability. The compiler will make you answer
-   `isCacheable`: say `true` only if your prompt repeats near-identically across
-   calls (§4.5).
+   `[SLMPerf]` lines.
 4. Expose it through `ConversationStore`, not straight to the view.
 5. Check the `[SLMPerf]` line for your feature against the 3 s budget.
 
@@ -376,7 +347,8 @@ UI observes.
   *and* the chat template.
 - **Quantization** — storing weights at reduced precision. Our base is `Q8_0`
   (8-bit): ~291 MB instead of ~1 GB, with a small quality cost.
-- **Context window** — how many tokens fit at once. 1024 per slot here.
+- **Context window** — how many tokens fit at once. 1024 per call here, prompt
+  and reply together (`ChatLM.contextTokens()`).
 - **Prefill / decode** — §4.4.
 - **KV cache** — §4.5.
 - **EOS/EOG** — the token by which the model says "I'm done".
@@ -423,14 +395,11 @@ Every cached slot would then hold K/V computed under the old weights, and the
 model produces fluent, confident, *wrong* output. No error, no crash, no log
 line.
 
-The fix is no longer a rule, it is the cache key: **each slot records which
-adapter produced its K/V, and slots match on (tokens, adapter), never tokens
-alone** (`CacheSlot::adapter`, `-pickSlotFor:`). A slot under a different adapter
-scores zero and is re-prefilled rather than reused. The failure mode that
-motivated the old rule is now structurally impossible instead of merely avoided
-— but only while that field exists. If someone "optimizes away" the adapter tag,
-or the reload in `applyAdapterChange()`, the silent corruption comes straight
-back and no test that checks for exceptions will catch it.
+What makes it safe now is that **the KV cache is cleared at the start of every
+generation** (§4.5), so no K/V outlives the adapter it was computed under. If
+someone adds prefix reuse back for speed, the cache key must include the adapter
+(as the design on `main` does). Otherwise the silent corruption comes straight
+back, and no test that checks for exceptions will catch it.
 
 **What a switch actually costs.** Measured on the booted simulator, CPU backend,
 from the app's own `[SLMPerf]` lines (~70 samples):
@@ -440,7 +409,6 @@ from the app's own `[SLMPerf]` lines (~70 samples):
 | cold init (`llama_adapter_lora_init`) | first touch of a pack, per app session | **50–110 ms**, ≈2 ms per MB; worst seen 245 ms |
 | warm switch | every later switch to that pack | **0.000 s** — rewrites a map on the context |
 | same adapter | the common case | no-op, llama.cpp returns early |
-| **lost KV prefix** | every switch, warm or cold | **a full re-prefill — 0.6–1.9 s** on a suggest prompt |
 
 The parse is the small half *and* the free half. `prewarmAdapter` moves it off
 the budgeted call (a conversation prewarms during the 1.2 s auto-suggest
@@ -454,11 +422,6 @@ Two traps in reading those numbers:
   decode + overhead accounts for all of `TOTAL`, and the adapter work surfaces
   only as `callback +0.106s` and in the `TURN` line. Judge a cold switch by
   `TURN`, or you will under-count exactly the case that threatens the budget.
-- **The prefix loss only bites past two languages.** There are two cacheable
-  slots and the adapter is part of the key, so alternating between two
-  conversations in two languages keeps *both* prefixes warm. A third evicts one.
-  Non-cacheable features share the scratch slot and never disturb them, even
-  though they flip the adapter.
 
 **Why a separate file and not merged weights:** merging means every fine-tune
 iteration is a full 291–774 MB re-download plus ~1.2 GB transient disk, because
@@ -589,13 +552,13 @@ Each of these looks arbitrary and fails silently or expensively if changed.
 - **`ChatLM.mm:394` — `mp.use_extra_bufts = false`.** Repacking doubled RAM
   (~800 MB peak). Together with the line above this is the difference between
   running and being jetsammed on an older device.
-- **`kSlotCount = 3` / `kCtxPerSlot = 1024`.** Two cacheable slots plus one
-  scratch for non-repeating prompts, so a one-off translate doesn't evict the
-  chat prefix. Changing the count changes `n_ctx` and `n_seq_max` together.
-- **`CacheSlot::adapter`, and the `_slots[i].adapter != adapter` skip in
-  `-pickSlotFor:`.** The only thing making per-call adapters safe. Delete it and
-  a prefix computed under one language gets reused under another: fluent,
-  confident, wrong, and completely silent (§5).
+- **`kCtx = 1024`.** Prompt plus reply for one call. `ChatService` derives its
+  chunk and output budgets from `ChatLM.contextTokens()`, so change it there,
+  never as a second literal.
+- **`llama_memory_clear` at the start of `runSystem:`.** The only thing making
+  per-call adapters safe. Remove it and a prefix computed under one language
+  gets reused under another: fluent, confident, wrong, and completely silent
+  (§5).
 - **Temperature ≥ 0.1 everywhere.** At exactly 0 the greedy sampler path returns
   `nil` instantly. No error — just an empty result.
 - **`GuardrailTests/` fixtures.** These are reference outputs from the *original*
@@ -709,29 +672,16 @@ adapter looks like a quality regression, not an error.
 **Performance budget.** Auto-suggest has a 3-second per-turn target. Prefill,
 not decode, is ~73% of a turn — optimize prompt length before sampling params.
 
-**`BenchmarkView`** (Settings) measures load time, memory and tokens/sec per
-model. It calls `releaseSLMs()` / `restoreSLMs()` so measurements aren't
-polluted by already-mapped pages; **the app's SLM features are dead between
-those two calls**, so they must stay paired.
+**Benchmarking was removed on the `integration` branch** — `BenchmarkView`,
+`BenchmarkHarness` and the throughput probes. The tooling and the measurements
+it produced are on `main` (see PERFORMANCE.md). On this branch, read the
+`[SLMPerf]` line: TTFT, decode tok/s, total and stop reason per call.
+`releaseSLMs()` / `restoreSLMs()` remain for quitting and switching backend;
+**the app's SLM features are dead between those two calls**, so they must stay
+paired.
 
-Measurements — two of the three I originally flagged have moved:
-
-1. **Adapter overhead — partly taken.** The *load* half is measured: 50–110 ms to
-   parse a pack, and a full re-prefill on every switch (§5). The *per-token* half
-   is still the ~6% arithmetic estimate; that one needs the random-init adapter in
-   `BenchmarkHarness`.
-2. **Format-adherence rate** (what % of outputs parse) as a benchmark metric —
-   still not taken.
-3. **Prefix-reuse hit rate** from `cachedPrefixTokenCount` — partly taken, and it
-   turned up something worth chasing. **Qwen3.5 suggest turns never report a cache
-   hit.** They log `no reuse, best match 268 tok` even on a full match, while
-   Qwen2.5 logs a real `cached 169, eval 1`. Two candidates, and the log cannot
-   tell them apart: the hybrid SSM blocks make `llama_memory_seq_rm` refuse a
-   partial removal so the code falls back to clearing the slot, or prefix reuse
-   was simply switched off in Settings for that session. **The fallback path has
-   no log line of its own** — add one and the question is settled. If it is the
-   first, the newest and largest checkpoint pays a full prefill every turn:
-   0.6–1.9 s, every turn, against a 3 s budget.
+Still unmeasured: the *per-token* cost of an adapter (the ~6% figure is
+arithmetic) and a format-adherence rate (what % of outputs parse).
 
 **Adding a language** is on me, not you: train the pack, quantize to GGUF, send
 you the file plus a `LoRAAdapter` entry with its real SHA-256. Settings picks it

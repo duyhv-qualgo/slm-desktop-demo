@@ -312,9 +312,9 @@ enum Prompts {
     }
 
     /// Render the recent group transcript as `Name: text` lines (windowed).
-    static func groupTranscript(_ messages: [ChatMessage]) -> String {
+    static func groupTranscript(_ messages: [any SLMMessage]) -> String {
         messages.suffix(historyWindow).map { m in
-            let who = m.sender == .you ? userName : (m.authorName ?? friendName)
+            let who = m.isFromUser ? userName : (m.authorName ?? friendName)
             return "\(who): \(m.text)"
         }.joined(separator: "\n")
     }
@@ -470,9 +470,9 @@ enum Prompts {
     /// The latest INCOMING message is tried on its own first so a mid-thread
     /// language switch is respected, then the recent window as one block — chat
     /// turns are short ("ok", "haha") and language ID needs text to work with.
-    static func conversationLanguage(_ history: [ChatMessage],
+    static func conversationLanguage(_ history: [any SLMMessage],
                                      native: TranslateLanguage) -> TranslateLanguage {
-        let latest = (history.last { $0.sender != .you } ?? history.last)?.text ?? ""
+        let latest = (history.last { !$0.isFromUser } ?? history.last)?.text ?? ""
         if let lang = identify(latest) { return lang }
 
         // Nothing conclusive in the message being replied to. Fall back to the same
@@ -627,7 +627,7 @@ enum Prompts {
     /// `conversationLanguage` and use the SAME value to pick the LoRA pack this
     /// generation runs under, so the prompt and the adapter can't disagree. It is a
     /// parameter rather than something computed in here for exactly that reason.
-    static func suggestReplies(history: [ChatMessage],
+    static func suggestReplies(history: [any SLMMessage],
                                friendName: String = friendName,
                                language: TranslateLanguage,
                                window: Int = suggestWindow,
@@ -646,12 +646,12 @@ enum Prompts {
     /// The window advances in `historyWindowStride` blocks rather than sliding by
     /// one, so consecutive suggest prompts share a byte-identical prefix and the
     /// engine's KV cache can skip re-prefilling it. See `historyWindowStride`.
-    static func renderHandles(_ messages: [ChatMessage], friendName: String = friendName,
+    static func renderHandles(_ messages: [any SLMMessage], friendName: String = friendName,
                               window: Int = suggestWindow,
                               stride: Int = historyWindowStride) -> String {
         messages.dropFirst(windowStart(messageCount: messages.count,
                                        window: window, stride: stride)).map { m in
-            let who = m.sender == .you ? userName : (m.authorName ?? friendName)
+            let who = m.isFromUser ? userName : (m.authorName ?? friendName)
             return "<\(who)>: \(m.text)"
         }.joined(separator: "\n")
     }
@@ -744,7 +744,7 @@ enum Prompts {
     /// language they chose in Settings; pass `language` to override. The model
     /// replies with `{"task":"summarization","summary":"…"}` — extract it with
     /// `parseSummary`.
-    static func summarize(_ messages: [ChatMessage],
+    static func summarize(_ messages: [any SLMMessage],
                           friendName: String = friendName,
                           language: String? = nil,
                           native: TranslateLanguage = .vietnamese) -> String {
@@ -763,8 +763,8 @@ enum Prompts {
     /// re-summarizing the thread you already read. When there's no prior context this
     /// collapses to the plain `summarize` of the new messages. Same JSON output —
     /// parse with `parseSummary`.
-    static func summarizeUnread(context: [ChatMessage],
-                                unread: [ChatMessage],
+    static func summarizeUnread(context: [any SLMMessage],
+                                unread: [any SLMMessage],
                                 friendName: String = friendName,
                                 language: String? = nil,
                                 native: TranslateLanguage = .vietnamese) -> String {
@@ -786,10 +786,10 @@ enum Prompts {
 
     /// Render messages as `[Name]:` lines using each speaker's real name — the
     /// device owner (`userName`) for your messages, the contact for theirs.
-    private static func renderNamed(_ messages: [ChatMessage], friendName: String) -> String {
+    private static func renderNamed(_ messages: [any SLMMessage], friendName: String) -> String {
         messages.map { m in
             // In a group, each bot message carries its own author name.
-            let who = m.sender == .you ? userName : (m.authorName ?? friendName)
+            let who = m.isFromUser ? userName : (m.authorName ?? friendName)
             return "[\(who)]: \(m.text)"
         }.joined(separator: "\n")
     }
@@ -815,9 +815,8 @@ enum Prompts {
         partialValue(from: raw, key: "summary")
     }
 
-    /// The same, for the translation feature's `{"translation":"…"}` output.
-    /// Not yet wired to a UI; kept beside `partialSummary` so both formats stay
-    /// handled by one implementation rather than drifting apart.
+    /// The same, for the translation feature's `{"translation":"…"}` output, used
+    /// by `ChatService.translateLongStream`.
     static func partialTranslation(from raw: String) -> String? {
         partialValue(from: raw, key: "translation")
     }
@@ -851,10 +850,25 @@ enum Prompts {
             // block, so a reasoning model shows nothing until it starts answering.
             let lead = raw.drop { $0 == " " || $0 == "\n" || $0 == "\t" || $0 == "\r" }
             if lead.first == "{" { return nil }
-            let cleaned = unwrapBrackets(clean(raw))
+            let cleaned = unwrapBrackets(clean(dropUnclosedTag(raw)))
             return cleaned.isEmpty ? nil : cleaned
         }
         return partialJSONValue(from: raw, key: key)
+    }
+
+    /// Cut a `[[…` tag the model hasn't closed yet (and a lone trailing `[` that
+    /// may become one). `clean` removes whole `[[…]]` tags, so without this the
+    /// translation finetune's `[[LANG:English -> Vietnamese]]` preamble renders as
+    /// `[[LANG:English -> H` for a few frames and then, once it closes, the text
+    /// jumps back to `H`.
+    private static func dropUnclosedTag(_ s: String) -> String {
+        var s = s
+        if let open = s.range(of: "[[", options: .backwards),
+           s.range(of: "]]", range: open.upperBound..<s.endIndex) == nil {
+            s = String(s[..<open.lowerBound])
+        }
+        if s.hasSuffix("[") { s.removeLast() }
+        return s
     }
 
     /// Locate `"<key>"` used as a KEY — i.e. followed by `:` — not as a value.
@@ -1329,7 +1343,7 @@ enum Prompts {
     /// same question ("what should I say next?") and disagreeing about the
     /// language would be visible to the user as one chip row contradicting the
     /// other.
-    static func composeLanguage(history: [ChatMessage],
+    static func composeLanguage(history: [any SLMMessage],
                                 draft: String,
                                 native: TranslateLanguage) -> TranslateLanguage {
         if let drafted = sourceLanguage(of: draft) { return drafted }
@@ -1354,7 +1368,7 @@ enum Prompts {
     /// The model replies with `[[REPLY]] …`, or `[[REFUSE:HARMFUL_INSTRUCTION]]`
     /// when the instruction asks for something it won't write — parse it with
     /// `parseCompose`.
-    static func magicCompose(history: [ChatMessage],
+    static func magicCompose(history: [any SLMMessage],
                              instruction: ComposeInstruction,
                              language: TranslateLanguage,
                              draft: String = "",

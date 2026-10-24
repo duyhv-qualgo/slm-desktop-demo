@@ -2,9 +2,8 @@
 
 macOS (Apple Silicon) port of the iOS on-device SLM chat demo (`../demo`).
 Every intelligent feature runs locally: the SLM through **llama.cpp / GGUF**
-(Metal); semantic search through **LiteRT-LM** (EmbeddingGemma 2); the
-guardrail and image tagging through the **TFLite C API** bundled in that same
-LiteRT-LM library (as on iOS); language detection in plain Swift. The chat partner "Alex" replies through the remote API.
+(Metal); the guardrail and image tagging through the **TFLite C API** bundled
+in the LiteRT-LM library (as on iOS); language detection in plain Swift. The chat partner "Alex" replies through the remote API.
 
 Read the iOS repo's [HANDOFF.md](docs/HANDOFF.md) for how the engine works and
 which files are coupled to the trained weights. That applies unchanged here.
@@ -46,7 +45,7 @@ Sources in `SLMChat/` and `GuardrailTests/` are a copy of the iOS app. Changes:
 | `View/Platform.swift` | new — `PlatformImage`, `Clipboard`, toolbar placements, keyboard dismissal |
 | other `View/*` | restyled; iOS-only modifiers routed through `Platform.swift` |
 | `Engine/DesktopModels.swift` | new — ships **Qwen2.5 0.5B and Qwen3.5 0.8B only** (default Qwen3.5); Gemma-3 270M and Qwen3 0.6B and their packs are left out |
-| `Engine/MessageEmbedder.swift`, `Store/MessageSearch.swift` | new — semantic text + photo search (EmbeddingGemma 2 via LiteRT-LM), index on device only |
+| `Store/MessageSearch.swift` | new — exact text search across all chats |
 | `Engine/ImageTagEngine.swift` | macOS decode via ImageIO (EXIF orientation baked in) |
 | `Model/Conversation.swift` | suggestions withdrawn while anyone is typing (`isBotTyping`, `isDrafting`); `markSeen` for read-on-view |
 

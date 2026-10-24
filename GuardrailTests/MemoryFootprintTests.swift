@@ -122,7 +122,7 @@ final class MemoryFootprintTests: XCTestCase {
 
         try? await Task.sleep(nanoseconds: 2_000_000_000)
 
-        XCTAssertLessThanOrEqual(group.pendingScreenings, MessageScreener.maxPending,
+        XCTAssertLessThanOrEqual(group.pendingScreenings, MessageScreening.maxPending,
                                  "\(group.pendingScreenings) messages still queued — "
                                + "the cap is not holding, and each is a strong ref")
         print("MEM | pending after a 600-message flood settles: \(group.pendingScreenings)")

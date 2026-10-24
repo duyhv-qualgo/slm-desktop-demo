@@ -1,27 +1,8 @@
 import Foundation
 
-/// Schedules guardrail screening for a thread's messages.
-///
-/// Extracted because the naive version — one detached `Task` per message, run in
-/// whatever order they were created — has two defects that only appear under
-/// load, and both were measured:
-///
-///  1. **Wrong order.** A 200-row flick queued 210 messages and finished 17 of
-///     them. The rest drained FIFO, so the message on screen waited behind ~200
-///     the reader had already passed and would never return to.
-///  2. **No shedding.** Every row scrolled past stayed queued forever, even
-///     though nobody would look at it again.
-///
-/// This replaces that with a single drain loop over a pending set, always taking
-/// the message NEAREST THE VIEWPORT next, and dropping the farthest work when the
-/// queue grows past `maxPending`. Shedding is safe because it is not a decision
-/// not to screen: a shed message is forgotten entirely, so scrolling back to it
-/// re-requests it through `onAppear` like any other row.
-///
-/// Shared by `Conversation` and `GroupChat` — the scheduling is identical and is
-/// too easy to get subtly wrong twice.
-@MainActor
-final class MessageScreener {
+/// `MessageScreener`'s tuning and priorities. Outside the generic class so
+/// callers can name them without a message type.
+enum MessageScreening {
 
     /// How far either side of the visible row to screen ahead.
     ///
@@ -49,9 +30,35 @@ final class MessageScreener {
         /// viewport, and persisted with coalescing.
         case background
     }
+}
+
+/// Schedules guardrail screening for a thread's messages.
+///
+/// Extracted because the naive version — one detached `Task` per message, run in
+/// whatever order they were created — has two defects that only appear under
+/// load, and both were measured:
+///
+///  1. **Wrong order.** A 200-row flick queued 210 messages and finished 17 of
+///     them. The rest drained FIFO, so the message on screen waited behind ~200
+///     the reader had already passed and would never return to.
+///  2. **No shedding.** Every row scrolled past stayed queued forever, even
+///     though nobody would look at it again.
+///
+/// This replaces that with a single drain loop over a pending set, always taking
+/// the message NEAREST THE VIEWPORT next, and dropping the farthest work when the
+/// queue grows past `MessageScreening.maxPending`. Shedding is safe because it is not a decision
+/// not to screen: a shed message is forgotten entirely, so scrolling back to it
+/// re-requests it through `onAppear` like any other row.
+///
+/// Shared by `Conversation` and `GroupChat` — the scheduling is identical and is
+/// too easy to get subtly wrong twice.
+@MainActor
+final class MessageScreener<Message: SLMMessage> {
+
+    typealias Priority = MessageScreening.Priority
 
     /// Messages waiting, keyed by id so a re-request can't double-enter.
-    private var pending: [UUID: (message: ChatMessage, index: Int)] = [:]
+    private var pending: [UUID: (message: Message, index: Int)] = [:]
 
     /// Ids already queued, running, or done — the dedupe gate. A shed message is
     /// REMOVED from this, which is what lets `onAppear` ask for it again.
@@ -73,14 +80,14 @@ final class MessageScreener {
 
     var pendingCount: Int { pending.count }
 
-    private let screen: (ChatMessage, Priority) async -> Void
+    private let screen: (Message, Priority) async -> Void
 
-    init(screen: @escaping (ChatMessage, Priority) async -> Void) {
+    init(screen: @escaping (Message, Priority) async -> Void) {
         self.screen = screen
     }
 
     /// Screen `message` now, ahead of anything queued.
-    func screenNow(_ message: ChatMessage) async {
+    func screenNow(_ message: Message) async {
         guard needsScreening(message), !claimed.contains(message.id) else { return }
         claimed.insert(message.id)
         pending.removeValue(forKey: message.id)   // it may have been queued already
@@ -93,14 +100,14 @@ final class MessageScreener {
     /// Cheap to call from `onAppear` on every row — anything already claimed
     /// returns immediately, which is the common case once look-ahead is ahead of
     /// the scroll.
-    func viewportDidShow(index: Int, in messages: [ChatMessage]) {
+    func viewportDidShow(index: Int, in messages: [Message]) {
         guard messages.indices.contains(index) else { return }
         anchor = index
 
         enqueue(messages[index], at: index)
         // Outward from the anchor, so the nearest neighbours are queued first
         // even before priority ordering gets a say.
-        for d in 1...Self.lookAhead {
+        for d in 1...MessageScreening.lookAhead {
             if messages.indices.contains(index - d) { enqueue(messages[index - d], at: index - d) }
             if messages.indices.contains(index + d) { enqueue(messages[index + d], at: index + d) }
         }
@@ -116,11 +123,11 @@ final class MessageScreener {
 
     // MARK: - Internals
 
-    private func needsScreening(_ message: ChatMessage) -> Bool {
-        message.safetyLabel == nil && !message.text.isEmpty
+    private func needsScreening(_ message: Message) -> Bool {
+        message.safety == nil && !message.text.isEmpty
     }
 
-    private func enqueue(_ message: ChatMessage, at index: Int) {
+    private func enqueue(_ message: Message, at index: Int) {
         guard needsScreening(message), !claimed.contains(message.id) else { return }
         claimed.insert(message.id)
         pending[message.id] = (message, index)
@@ -128,9 +135,9 @@ final class MessageScreener {
 
     /// Drop the work furthest from the viewport until the queue fits.
     private func shedIfNeeded() {
-        guard pending.count > Self.maxPending else { return }
+        guard pending.count > MessageScreening.maxPending else { return }
         let ordered = pending.sorted { distance($0.value.index) > distance($1.value.index) }
-        for (id, _) in ordered.prefix(pending.count - Self.maxPending) {
+        for (id, _) in ordered.prefix(pending.count - MessageScreening.maxPending) {
             pending.removeValue(forKey: id)
             claimed.remove(id)          // so a return visit can ask again
             shed += 1
@@ -155,7 +162,7 @@ final class MessageScreener {
         }
     }
 
-    private func takeNearest() -> ChatMessage? {
+    private func takeNearest() -> Message? {
         guard let (id, entry) = pending.min(by: { distance($0.value.index) < distance($1.value.index) })
         else { return nil }
         pending.removeValue(forKey: id)

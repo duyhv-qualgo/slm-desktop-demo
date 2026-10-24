@@ -121,8 +121,8 @@ final class GroupChat: ObservableObject {
     ///    just a side. That is the group's whole point for a guardrail: in a 1:1
     ///    chat "the other person" is unambiguous, while a group needs to know
     ///    WHICH member sent the flagged message.
-    /// Bidirectional look-ahead around the visible row. See `MessageScreener`.
-    static let screenLookAhead = MessageScreener.lookAhead
+    /// Bidirectional look-ahead around the visible row. See `MessageScreening`.
+    static let screenLookAhead = MessageScreening.lookAhead
 
     /// Same scheduler as `Conversation` — nearest-to-viewport first, shed the
     /// far work. Identical logic, and too easy to get subtly wrong twice.

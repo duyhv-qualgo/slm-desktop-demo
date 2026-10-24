@@ -66,18 +66,6 @@ if [[ ! -e Resources/langdetect-weights.bin ]]; then
     || missing+=("Resources/langdetect-weights.bin (scripts/build_langdetect_weights.py failed)")
 fi
 
-# --- Text + photo embeddings for semantic search (not in the iOS repo; Hugging Face) --
-EMB=embeddinggemma-2-text-vision-440m.litertlm
-EMB_SHA=92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0
-if [[ ! -e "Resources/$EMB" ]]; then
-  echo "downloading $EMB (388 MB)…"
-  curl -fL --progress-bar -o "Resources/$EMB.part" \
-    "https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm/resolve/main/$EMB" \
-    && echo "$EMB_SHA  Resources/$EMB.part" | shasum -a 256 -c --quiet \
-    && mv "Resources/$EMB.part" "Resources/$EMB" \
-    || { rm -f "Resources/$EMB.part"; missing+=("Resources/$EMB (download or checksum failed)"); }
-fi
-
 # --- Remote chat partner config (secret, gitignored) -------------------------
 [[ -e "$IOS/Resources/APIConfig.plist" ]] && clone Resources/APIConfig.plist Resources \
   || echo "note: no APIConfig.plist — the chat partner will be mute (see APIConfig.example.plist)"

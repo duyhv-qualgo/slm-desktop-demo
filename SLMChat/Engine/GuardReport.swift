@@ -149,7 +149,7 @@ enum GuardReport {
     ///  - **Rate limiting and abuse handling**, since coordinated reporting is the
     ///    obvious attack on any reputation signal built from this.
     @discardableResult
-    static func submit(_ message: ChatMessage,
+    static func submit(_ message: some SLMMessage,
                        reason: ReportReason,
                        note: String = "",
                        author: String,

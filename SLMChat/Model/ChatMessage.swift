@@ -273,3 +273,8 @@ struct StoredMessage: Codable {
     /// written before reporting existed still load (nil reads as "not reported").
     var reported: Bool?
 }
+
+/// The demo's message type, as the on-device features see it.
+extension ChatMessage: SLMMessage {
+    var isFromUser: Bool { sender == .you }
+}

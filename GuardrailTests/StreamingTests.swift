@@ -86,6 +86,16 @@ final class PartialValueTests: XCTestCase {
         }
     }
 
+    /// The translation finetune opens with a `[[LANG:… -> …]]` tag. While the tag
+    /// is still streaming nothing may render, or the text jumps backwards the
+    /// moment it closes and `clean` strips it.
+    func testUnclosedTagRendersNothing() {
+        let frames = ["[", "[[", "[[LANG:English -> H", "[[LANG:English -> Vietnamese]",
+                      "[[LANG:English -> Vietnamese]] Hẹn", "[[LANG:English -> Vietnamese]] Hẹn gặp"]
+        let partials = frames.compactMap { Prompts.partialTranslation(from: $0) }
+        XCTAssertEqual(partials, ["Hẹn", "Hẹn gặp"])
+    }
+
     /// The trained JSON shape still works — the fix must not trade one for the other.
     func testJSONValueIsExtracted() {
         let mid = #"{"task":"summarization","summary":"They agreed to meet at seven"#

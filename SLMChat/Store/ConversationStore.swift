@@ -92,7 +92,7 @@ final class ConversationStore: ObservableObject {
     /// survives navigation. In-memory only — not persisted.
     lazy var group = GroupChat(service: service)
 
-    /// Exact + semantic search over every message (on-device embeddings).
+    /// Exact text search over every message.
     lazy var search = MessageSearch(store: self)
 
     /// Predefined people you can start a new chat with. Persona and avatar derive
@@ -167,7 +167,6 @@ final class ConversationStore: ObservableObject {
     /// `onPersist` hook after a durable change.
     func save() {
         ConversationPersistence.save(conversations.map(\.snapshot))
-        search.scheduleRefresh()
     }
 
     /// Remove a conversation from the inbox and persist the change.
@@ -214,8 +213,6 @@ final class ConversationStore: ObservableObject {
         if res.ok {
             isReady = true
             statusText = res.status
-            // After the chat model, so search indexing never delays it.
-            Task { await search.start() }
         } else {
             errorMessage = res.error
             statusText = nil

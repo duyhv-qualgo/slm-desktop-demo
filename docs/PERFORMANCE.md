@@ -7,6 +7,13 @@ devices, so nobody re-derives it or re-runs the experiments that already failed.
 Companion to [HANDOFF.md §4](HANDOFF.md), which covers how `ChatLM.mm` works.
 Where they overlap, HANDOFF describes the *code*; this describes the *physics*.
 
+> **On the `integration` branch:** the numbers below were measured on `main`,
+> with the 3-slot KV prefix cache and the benchmark tooling (`BenchmarkHarness`,
+> the probes). Both were removed for handover — every call now pays a full
+> prefill, so per-turn suggest latency is higher than the cached figures here.
+> The device physics (prefill vs decode, CPU vs GPU, memory) is unchanged. See
+> [integration.md](integration.md).
+
 All figures below are measured, on the devices named. Where something is an
 estimate or an inference it says so.
 

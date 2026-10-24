@@ -1082,8 +1082,8 @@ final class Conversation: ObservableObject, Identifiable {
 
     // MARK: - Viewport screening (bulk history)
 
-    /// Bidirectional look-ahead around the visible row. See `MessageScreener`.
-    static let screenLookAhead = MessageScreener.lookAhead
+    /// Bidirectional look-ahead around the visible row. See `MessageScreening`.
+    static let screenLookAhead = MessageScreening.lookAhead
 
     /// Ordering, look-ahead and shedding all live in the screener — see that type
     /// for why a task-per-message drained FIFO was wrong under a fast scroll.

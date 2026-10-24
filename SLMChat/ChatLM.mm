@@ -41,11 +41,11 @@ namespace {
 // LoRA adapter can never be read under another).
 constexpr int kCtx = 1024;  // prompt + generated tokens for one call
 
-// Benchmark mode trades for a longer context. The fixed pass forces an exact
-// decode length and ignores EOS, so prompt + output must both fit: 512 in + 512
-// out needs more than the app's 1024 tokens, and hitting that ceiling would
-// corrupt a benchmark rather than fail it.
-constexpr int kBenchmarkCtx = 2048;
+// llama.cpp abort callback: polled during llama_decode, so -cancel can stop a
+// long prompt pass part-way instead of waiting for it to finish.
+bool ChatLMShouldAbort(void *data) {
+    return static_cast<std::atomic<bool> *>(data)->load(std::memory_order_relaxed);
+}
 
 // One-time global backend init (ggml/Metal registration).
 void EnsureBackend() {
@@ -114,53 +114,15 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Per-turn timing/token breakdown recorded for EVERY generation (see ChatLM.h).
+// Per-generation metrics (see ChatLM.h). Readonly in the header; redeclared
+// readwrite here so the bridge can fill them.
 @interface ChatLMTurnMetrics ()
-@property (nonatomic, readwrite) int    promptTokenCount;
-@property (nonatomic, readwrite) double prefillSeconds;
-@property (nonatomic, readwrite) double prefillTokensPerSecond;
 @property (nonatomic, readwrite) double timeToFirstTokenSeconds;
-@property (nonatomic, readwrite) int    decodeTokenCount;
-@property (nonatomic, readwrite) double decodeSeconds;
 @property (nonatomic, readwrite) double decodeTokensPerSecond;
 @property (nonatomic, readwrite) double totalSeconds;
-@property (nonatomic, readwrite) double overheadSeconds;
-@property (nonatomic, readwrite) int    outputCharCount;
 @property (nonatomic, readwrite, copy) NSString *stopReason;
-@property (nonatomic, readwrite, copy) NSString *adapterName;
-@property (nonatomic, readwrite) double adapterSeconds;
-@property (nonatomic, readwrite, copy) NSString *adapterState;
 @end
-
 @implementation ChatLMTurnMetrics
-- (NSString *)summaryLine {
-    // lora is always printed, in a fixed shape, even when nothing happened —
-    // "lora=x/same +0.000s" is what makes the field greppable and averageable.
-    // A line that omits the term when it is zero forces every consumer to handle
-    // two formats and quietly under-counts the cold cases.
-    return [NSString stringWithFormat:
-            @"in=%d tok | prefill %.3fs (%.1f tok/s) | ttft %.3fs | "
-            @"out=%d tok (%d chars) | decode %.3fs (%.1f tok/s) | "
-            @"lora=%@/%@ +%.3fs | overhead %.3fs | TOTAL %.3fs | stop=%@",
-            _promptTokenCount, _prefillSeconds, _prefillTokensPerSecond,
-            _timeToFirstTokenSeconds,
-            _decodeTokenCount, _outputCharCount, _decodeSeconds, _decodeTokensPerSecond,
-            _adapterName ?: @"none", _adapterState ?: @"?", _adapterSeconds,
-            _overheadSeconds, _totalSeconds, _stopReason ?: @"?"];
-}
-@end
-
-// ---------------------------------------------------------------------------
-// Runtime-measured metrics for one generation (see ChatLM.h). Properties are
-// readonly in the header; redeclared readwrite here so the bridge can fill them.
-@interface ChatLMBenchmarkInfo ()
-@property (nonatomic, readwrite) double timeToFirstTokenSeconds;
-@property (nonatomic, readwrite) int    prefillTokenCount;
-@property (nonatomic, readwrite) double prefillTokensPerSecond;
-@property (nonatomic, readwrite) int    decodeTokenCount;
-@property (nonatomic, readwrite) double decodeTokensPerSecond;
-@end
-@implementation ChatLMBenchmarkInfo
 @end
 
 // ---------------------------------------------------------------------------
@@ -173,16 +135,11 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     std::string        _lastError;
     bool               _isThinking; // Qwen3/Bonsai-style reasoning model
     int                _nThreads;
-    int                _batchThreads;      // prefill override; 0 = _nThreads
-    // Benchmark instrumentation (set at load; used by -benchmarkStream…).
-    bool               _benchmark;         // benchmark harness mode (forced decode)
-    int                _forcedDecodeTokens;// >0: decode exactly N, ignore EOS
-    double             _lastTtftSeconds;   // wall time to first token of last run
-    int                _lastDecodeCount;   // tokens actually emitted by last run
-    ChatLMTurnMetrics *_lastTurnMetrics;   // full breakdown of the last run
+    ChatLMTurnMetrics *_lastTurnMetrics;   // metrics of the last run
     llama_batch        _batch;             // reusable batch (capacity = n_batch)
     int                _batchCapacity;     // how many tokens _batch can hold
     bool               _batchAllocated;
+    std::atomic<bool>  _cancelRequested;   // set by -cancel from any thread
     NSString          *_activeBackend;     // what the load actually got
     // LoRA adapters, keyed by filesystem path and owned by this engine (each is
     // tied to _model's lifetime and freed in -dealloc).
@@ -224,10 +181,8 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
         _ctx   = nullptr;
         _vocab = nullptr;
         _isThinking = false;
-        _benchmark = false;
-        _forcedDecodeTokens = 0;
-        _lastTtftSeconds = 0;
         _batchAllocated = false;
+        _cancelRequested.store(false);
         // Pin inference to the PERFORMANCE-core cluster only. Batch-1 decode is
         // memory-bound; spilling onto efficiency cores barely raises tok/s but
         // pushes CPU usage very high and wastes power/thermal. perflevel0 = the
@@ -238,7 +193,6 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
             perf = (int)std::max(1u, std::min(4u, (hw ? hw : 4u) / 2u));
         }
         _nThreads = std::max(1, perf);
-        _batchThreads = 0;
     }
     return self;
 }
@@ -258,33 +212,8 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
 
 - (BOOL)loadWithModelPath:(NSString *)modelPath
                   backend:(NSString *)backend
-                 cacheDir:(nullable NSString *)cacheDir {
-    return [self loadWithModelPath:modelPath backend:backend cacheDir:cacheDir
-                          loraPath:nil enableBenchmark:NO forcedDecodeTokens:0
-                        activation:ChatLMActivationTypeAuto];
-}
-
-- (BOOL)loadWithModelPath:(NSString *)modelPath
-                  backend:(NSString *)backend
-                 cacheDir:(nullable NSString *)cacheDir
                  loraPath:(nullable NSString *)loraPath {
-    return [self loadWithModelPath:modelPath backend:backend cacheDir:cacheDir
-                          loraPath:loraPath enableBenchmark:NO forcedDecodeTokens:0
-                        activation:ChatLMActivationTypeAuto];
-}
-
-- (BOOL)loadWithModelPath:(NSString *)modelPath
-                  backend:(NSString *)backend
-                 cacheDir:(nullable NSString *)cacheDir
-                 loraPath:(nullable NSString *)loraPath
-          enableBenchmark:(BOOL)enableBenchmark
-       forcedDecodeTokens:(int)forcedDecodeTokens
-               activation:(ChatLMActivationType)activation {
-    (void)cacheDir;    // llama.cpp has no external kernel cache (LiteRT-LM did).
-    (void)activation;  // no per-tensor activation-precision knob on llama.cpp.
     EnsureBackend();
-    _benchmark          = enableBenchmark;
-    _forcedDecodeTokens = forcedDecodeTokens;
     _activeLoRAPath     = nil;
     _lastError.clear();
 
@@ -381,7 +310,7 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     // Cap context to keep the KV cache small on 4 GB devices (iPhone XS). The
     // feature prompts chunk their input to stay well under this budget.
     // Only the KV cache scales with this; the compute buffer follows n_ubatch.
-    cp.n_ctx           = enableBenchmark ? kBenchmarkCtx : kCtx;
+    cp.n_ctx           = kCtx;
     cp.n_seq_max       = 1;
     // Split logical vs physical batch to bound the compute buffer. The ggml
     // scheduler reserves a worst-case graph sized by n_ubatch, whose dominant
@@ -397,10 +326,10 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
     cp.n_batch         = cp.n_ctx;
     cp.n_ubatch        = 128;
     cp.n_threads       = _nThreads;
-    cp.n_threads_batch = _batchThreads > 0 ? _batchThreads : _nThreads;
-    // Keep llama.cpp's perf counters ON in every build, not just for benchmarks:
-    // they are what splits a turn into prefill vs decode with exact token counts
-    // (see ChatLMTurnMetrics). The cost is a couple of clock reads per decode.
+    cp.n_threads_batch = _nThreads;
+    // Keep llama.cpp's perf counters ON in every build:
+    // they give ChatLMTurnMetrics its decode rate. The cost is a couple of clock
+    // reads per decode.
     cp.no_perf         = false;
 
     _ctx = llama_init_from_model(_model, cp);
@@ -410,6 +339,8 @@ void ChatLMLogCallback(ggml_log_level level, const char *text, void * /*ud*/) {
         _model = nullptr;
         return NO;
     }
+    // _cancelRequested lives as long as self, which outlives _ctx (-dealloc).
+    llama_set_abort_callback(_ctx, ChatLMShouldAbort, &_cancelRequested);
 
     // --- LoRA adapter -------------------------------------------------------
     // Applied once, here, while the KV cache is still empty — the only moment
@@ -685,33 +616,20 @@ static std::string NormalizeRole(NSString *role) {
                     user:(NSString *)user
                maxTokens:(int)maxTokens
                     temp:(float)temp
-               ignoreEog:(bool)ignoreEog
              adapterPath:(nullable NSString *)adapterPath
                  onChunk:(void (^ _Nullable)(const std::string &, bool))onChunk {
     if (!_ctx) { _lastError = "engine not loaded"; if (onChunk) onChunk("", true); return ""; }
 
     // Put the requested adapter in force before anything is tokenized or decoded.
     // nil means "whatever the load asked for" — the overwhelmingly common case,
-    // and the one every feature except auto-suggest takes. `applied` is the
-    // adapter that actually took: a pack that failed to parse leaves the context
-    // bare.
-    NSString *wanted = adapterPath ?: _defaultLoRAPath;
-    // Classify BEFORE switching — afterwards every state looks like "same".
-    NSString *adapterState =
-        (wanted.length == 0 ? (_currentLoRAPath == nil) : [wanted isEqualToString:_currentLoRAPath])
-            ? @"same"
-            : (wanted.length == 0 || _adapters.find(wanted.UTF8String) != _adapters.end()
-                   ? @"warm" : @"cold");
-    const auto tAdapter0 = std::chrono::steady_clock::now();
-    const bool applied = [self activateAdapterPath:wanted];
-    const double adapterSeconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - tAdapter0).count();
-    NSString *adapterName = applied ? _currentLoRAPath.lastPathComponent : @"none";
+    // and the one every feature except auto-suggest takes. A pack that fails to
+    // parse leaves the context bare.
+    [self activateAdapterPath:adapterPath ?: _defaultLoRAPath];
 
     llama_perf_context_reset(_ctx);   // metrics reflect only this run
-    _lastTtftSeconds = 0;
-    _lastDecodeCount = 0;
     _lastTurnMetrics = nil;
+    // A cancel only applies to the generation running when it was requested.
+    _cancelRequested.store(false);
     _lastError.clear();
 
     // t0 starts before templating/tokenizing so totalSeconds and TTFT are the
@@ -724,7 +642,7 @@ static std::string NormalizeRole(NSString *role) {
     std::vector<llama_token> prompt_tokens = [self tokenizeSystem:system
                                                           history:history
                                                              user:user];
-    const int promptBudget = _benchmark ? kBenchmarkCtx : kCtx;
+    const int promptBudget = kCtx;
     if (!prompt_tokens.empty() && (int)prompt_tokens.size() > promptBudget) {
         // Caught here rather than at -decode: so the message names the prompt,
         // not the batch. A prompt this long means Prompts' chunking or history
@@ -738,13 +656,8 @@ static std::string NormalizeRole(NSString *role) {
     if (prompt_tokens.empty()) {
         _lastError = "tokenize failed or prompt too long";
         ChatLMTurnMetrics *m = [[ChatLMTurnMetrics alloc] init];
-        m.totalSeconds = m.overheadSeconds = elapsed();
+        m.totalSeconds = elapsed();
         m.stopReason = @"error";
-        // The adapter was switched before tokenizing, so this failed turn still
-        // paid for it — report it rather than showing a free error.
-        m.adapterName = adapterName;
-        m.adapterState = adapterState;
-        m.adapterSeconds = adapterSeconds;
         _lastTurnMetrics = m;
         if (onChunk) onChunk("", true);
         return "";
@@ -777,45 +690,28 @@ static std::string NormalizeRole(NSString *role) {
     int generated = 0;
     bool firstToken = true;
     NSString *stopReason = @"max_tokens";
-    // Wall time of the PROMPT pass, measured here rather than read back from
-    // llama.cpp. `llama_perf_context`'s t_p_eval_ms is accumulated inside
-    // synchronize() and is unreliable in this build: observed reporting 0.03 ms
-    // for a 269-token pass whose wall clock (ttft 3.45 s) proves otherwise, which
-    // printed as "prefill 0.000s (5977777.8 tok/s)" and dumped the missing
-    // seconds into `overhead`. It is intermittent — the same prompt size measures
-    // correctly on some runs — so it cannot be corrected, only replaced.
-    //
-    // n_p_eval (the token COUNT) stays llama.cpp's; that one is always right.
-    // Only the time is ours. The first loop iteration is the prompt pass by
-    // construction: nextCount is the whole prompt, and every later iteration
-    // sets it to 1.
-    double prefillSeconds = 0;
-    bool   firstPass = true;
+    double ttftSeconds = 0;
+    // The first loop iteration is the prompt pass (nextCount = the whole prompt);
+    // every later iteration decodes one token.
     while (generated < maxTokens) {
-        const auto tDecode0 = std::chrono::steady_clock::now();
+        if (_cancelRequested.load()) { stopReason = @"cancelled"; break; }
         if (![self decode:next count:nextCount atPos:nextPos]) {
+            // An abort from -cancel surfaces as a failed decode; it is not an
+            // error. The half-written KV cache is cleared by the next call.
+            if (_cancelRequested.load()) { stopReason = @"cancelled"; break; }
             _lastError = "llama_decode failed";
             stopReason = @"error";
             break;
         }
-        if (firstPass) {
-            // Includes the sampler's implicit synchronize() on the next line only
-            // for later passes; here it is the decode itself.
-            prefillSeconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - tDecode0).count();
-            firstPass = false;
-        }
         nextPos += nextCount;
         cur = llama_sampler_sample(smpl, _ctx, -1);
-        // In forced-decode benchmarks, keep going past EOS so every model decodes
-        // the same number of tokens; otherwise stop at end-of-generation.
-        if (!ignoreEog && llama_vocab_is_eog(_vocab, cur)) { stopReason = @"eos"; break; }
+        if (llama_vocab_is_eog(_vocab, cur)) { stopReason = @"eos"; break; }
 
         int np = llama_token_to_piece(_vocab, cur, piece, sizeof(piece),
                                       /*lstrip=*/0, /*special=*/false);
         if (np > 0) {
             if (firstToken) {  // wall time to first token = prefill + first decode
-                _lastTtftSeconds = elapsed();
+                ttftSeconds = elapsed();
                 firstToken = false;
             }
             pendingUTF8.append(piece, (size_t)np);
@@ -832,30 +728,14 @@ static std::string NormalizeRole(NSString *role) {
         nextCount = 1;
     }
 
-    _lastDecodeCount = generated;
-
-    // Fill the per-turn breakdown. Token COUNTS come from llama.cpp's counters
-    // (exact); the prompt pass's time is measured here (see `prefillSeconds`);
-    // wall clock covers everything around them.
-    //   n_eval / t_eval_ms — the single-token decode steps. n_eval is one lower
-    //     than `generated`: the first token falls out of the prompt pass.
+    // Decode rate from llama.cpp's counters: n_eval / t_eval_ms cover the
+    // single-token decode steps only (the first token falls out of the prompt
+    // pass), so the prompt doesn't dilute it.
     llama_perf_context_data d = llama_perf_context(_ctx);
     ChatLMTurnMetrics *m = [[ChatLMTurnMetrics alloc] init];
-    m.adapterName             = adapterName;
-    m.adapterState            = adapterState;
-    m.adapterSeconds          = adapterSeconds;
-    m.promptTokenCount        = (int)prompt_tokens.size();
-    // Measured around the prompt pass ourselves — see `prefillSeconds` above for
-    // why llama's t_p_eval_ms isn't trusted.
-    m.prefillSeconds          = prefillSeconds;
-    m.prefillTokensPerSecond  = prefillSeconds > 0 ? m.promptTokenCount / prefillSeconds : 0;
-    m.timeToFirstTokenSeconds = _lastTtftSeconds;
-    m.decodeTokenCount        = generated;
-    m.decodeSeconds           = d.t_eval_ms / 1000.0;
+    m.timeToFirstTokenSeconds = ttftSeconds;
     m.decodeTokensPerSecond   = d.t_eval_ms > 0 ? d.n_eval / (d.t_eval_ms / 1000.0) : 0;
-    m.outputCharCount         = (int)full.size();
     m.totalSeconds            = elapsed();
-    m.overheadSeconds         = std::max(0.0, m.totalSeconds - m.prefillSeconds - m.decodeSeconds);
     m.stopReason              = stopReason;
     _lastTurnMetrics = m;
 
@@ -871,56 +751,11 @@ static std::string NormalizeRole(NSString *role) {
          temperature:(float)temperature
              onChunk:(void (^)(NSString *, BOOL))onChunk {
     [self runSystem:system history:history user:user maxTokens:maxTokens temp:temperature
-          ignoreEog:false adapterPath:nil
+          adapterPath:nil
             onChunk:^(const std::string &chunk, bool done) {
                 NSString *s = [NSString stringWithUTF8String:chunk.c_str()];
                 onChunk(s ?: @"", done ? YES : NO);
             }];
-}
-
-- (nullable ChatLMBenchmarkInfo *)benchmarkStreamSystem:(nullable NSString *)system
-                                                history:(NSArray<NSDictionary<NSString *, NSString *> *> *)history
-                                                   user:(NSString *)user
-                                              maxTokens:(int)maxTokens
-                                            temperature:(float)temperature
-                                                onChunk:(void (^)(NSString *, BOOL))onChunk {
-    if (!_ctx || !_benchmark) { if (onChunk) onChunk(@"", YES); return nil; }
-
-    // forcedDecodeTokens pins the decode length and ignores EOS, so every model
-    // is measured over the same window; 0 leaves decoding natural.
-    const bool forced = _forcedDecodeTokens > 0;
-    const int  cap    = forced ? _forcedDecodeTokens : maxTokens;
-
-    [self runSystem:system history:history user:user maxTokens:cap temp:temperature
-          ignoreEog:forced adapterPath:nil
-            onChunk:^(const std::string &chunk, bool done) {
-                NSString *s = [NSString stringWithUTF8String:chunk.c_str()];
-                onChunk(s ?: @"", done ? YES : NO);
-            }];
-
-    // Read back the SAME per-turn metrics -runSystem: just recorded, rather than
-    // recomputing from llama.cpp's counters.
-    //
-    // This used to derive the prefill rate from d.t_p_eval_ms directly, which is
-    // the counter that intermittently reports ~0.03 ms for a pass taking seconds
-    // (see the note where ChatLMTurnMetrics.prefillSeconds is filled). That bug
-    // was fixed for the app's per-turn line and left here — so the BENCHMARK, the
-    // one place whose entire job is producing trustworthy numbers, was the last
-    // thing still reporting millions of tokens per second at random. One source
-    // of truth now.
-    llama_perf_context_data d = llama_perf_context(_ctx);
-    ChatLMTurnMetrics *turn = _lastTurnMetrics;
-    ChatLMBenchmarkInfo *info = [[ChatLMBenchmarkInfo alloc] init];
-    info.timeToFirstTokenSeconds = _lastTtftSeconds;
-    info.prefillTokenCount       = turn ? turn.promptTokenCount : d.n_p_eval;
-    info.prefillTokensPerSecond  = turn ? turn.prefillTokensPerSecond : 0;
-    // decodeTokenCount is the number of tokens actually generated (matches the
-    // forced-decode target). llama's n_eval is one lower — the first token comes
-    // out of the prefill pass, not a single-token decode — so use it only for the
-    // rate, where t_eval_ms is the matching decode-phase time.
-    info.decodeTokenCount        = _lastDecodeCount;
-    info.decodeTokensPerSecond   = d.t_eval_ms   > 0 ? d.n_eval   / (d.t_eval_ms   / 1000.0) : 0;
-    return info;
 }
 
 - (nullable NSString *)generateSystem:(nullable NSString *)system
@@ -931,14 +766,16 @@ static std::string NormalizeRole(NSString *role) {
                           adapterPath:(nullable NSString *)adapterPath {
     if (!_ctx) return nil;
     std::string out = [self runSystem:system history:history user:user
-                            maxTokens:maxTokens temp:temperature ignoreEog:false
+                            maxTokens:maxTokens temp:temperature
                             adapterPath:adapterPath onChunk:nil];
     if (!_lastError.empty()) return nil;
     return [NSString stringWithUTF8String:out.c_str()];
 }
 
-- (int)batchThreads { return _batchThreads > 0 ? _batchThreads : _nThreads; }
-- (void)setBatchThreads:(int)n { _batchThreads = std::max(0, n); }
+
+- (void)cancel {
+    _cancelRequested.store(true);
+}
 
 - (NSString *)lastError {
     return _lastError.empty() ? @"" : [NSString stringWithUTF8String:_lastError.c_str()];

@@ -432,7 +432,7 @@ final class Conversation: ObservableObject, Identifiable {
         let prompt = Prompts.suggestReplies(history: messages, friendName: contactName,
                                             language: language)
         // print (not NSLog): os_log truncates long strings, cropping the prompt.
-        print("[Suggest] SLM input prompt (1:1 with \(contactName)):\n\(prompt)\n[Suggest] --- end prompt ---")
+        contentPrint("[Suggest] SLM input prompt (1:1 with \(contactName)):\n\(prompt)\n[Suggest] --- end prompt ---")
         var result = Prompts.SuggestionResult(suggestions: [], refused: false, reason: nil)
         var sawEngineError = false
         var attempts = 0
@@ -455,8 +455,8 @@ final class Conversation: ObservableObject, Identifiable {
             result = Prompts.parseSuggestions(raw)
             // Single-line (escaped newlines) so it survives a "[Suggest]" console filter.
             let escaped = raw.replacingOccurrences(of: "\n", with: "\\n")
-            NSLog("[Suggest] attempt %d — raw SLM output: %@", attempt + 1, escaped)
-            NSLog("[Suggest] attempt %d — parsed: refused=%@ reason=%@ suggestions=%@",
+            contentLog("[Suggest] attempt %d — raw SLM output: %@", attempt + 1, escaped)
+            contentLog("[Suggest] attempt %d — parsed: refused=%@ reason=%@ suggestions=%@",
                   attempt + 1, "\(result.refused)", result.reason ?? "<nil>", "\(result.suggestions)")
             if result.refused || !result.suggestions.isEmpty { break }
         }
@@ -750,7 +750,7 @@ final class Conversation: ObservableObject, Identifiable {
                                           draft: composeDraft,
                                           friendName: contactName)
         // print (not NSLog): os_log truncates long strings, cropping the prompt.
-        print("[Compose] SLM input prompt (\(instruction.id) with \(contactName)):\n\(prompt)\n[Compose] --- end prompt ---")
+        contentPrint("[Compose] SLM input prompt (\(instruction.id) with \(contactName)):\n\(prompt)\n[Compose] --- end prompt ---")
 
         let raw = await service.taskEngine.complete(system: nil, history: [], user: prompt,
                                                     maxTokens: service.composeTokens,
@@ -762,7 +762,7 @@ final class Conversation: ObservableObject, Identifiable {
         let outcome: Prompts.ComposeOutcome
         if let raw {
             let escaped = raw.replacingOccurrences(of: "\n", with: "\\n")
-            NSLog("[Compose] raw SLM output: %@", escaped)
+            contentLog("[Compose] raw SLM output: %@", escaped)
             outcome = Prompts.parseCompose(raw)
         } else {
             NSLog("[Compose] SLM returned nil (engine error)")
@@ -892,17 +892,17 @@ final class Conversation: ObservableObject, Identifiable {
         let text = message.text
         guard Prompts.mightMentionEvent(text) else { return }
         let prompt = Prompts.extractEvent(from: text, language: service.nativeLanguage)
-        NSLog("[Event] input prompt:\n%@", prompt)
+        contentLog("[Event] input prompt:\n%@", prompt)
         let raw = await service.taskEngine.complete(system: nil, history: [],
                                                     user: prompt,
                                                     maxTokens: service.eventTokens,
                                                     temperature: service.eventTemp,
                                                     label: .event)
-        NSLog("[Event] raw SLM output: %@", raw ?? "<nil>")
+        contentLog("[Event] raw SLM output: %@", raw ?? "<nil>")
         guard let raw,
               let event = DetectedEvent.parse(raw),
               event.hasEvent else { return }
-        NSLog("[Event] parsed: intent=%@ name=%@ date=%@ time=%@ location=%@",
+        contentLog("[Event] parsed: intent=%@ name=%@ date=%@ time=%@ location=%@",
               event.intent, event.eventName, event.date, event.time, event.location)
         // Concreteness gate: farewell pleasantries ("gặp lại" + "sáng mai", no time/
         // place) are false alarms — don't raise the banner for them.

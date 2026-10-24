@@ -477,7 +477,7 @@ final class GroupChat: ObservableObject {
         let prompt = Prompts.suggestReplies(history: messages,
                                             language: language)  // renderHandles uses authorName
         // print (not NSLog): os_log truncates long strings, cropping the prompt.
-        print("[Suggest] SLM input prompt (group \"\(title)\"):\n\(prompt)\n[Suggest] --- end prompt ---")
+        contentPrint("[Suggest] SLM input prompt (group \"\(title)\"):\n\(prompt)\n[Suggest] --- end prompt ---")
         var result = Prompts.SuggestionResult(suggestions: [], refused: false, reason: nil)
         var attempts = 0
 

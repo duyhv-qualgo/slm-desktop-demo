@@ -102,8 +102,6 @@ enum SLMBackend {
     /// `.auto` means GPU unless the crash guard tripped. An EXPLICIT `.gpu`
     /// overrides the guard — the guard exists to stop an unattended crash loop,
     /// not to overrule someone deliberately retrying it from Settings.
-    ///
-    /// The benchmark harness bypasses this and names a backend explicitly.
     static func preferred(_ choice: SLMBackendOption = .auto) -> String {
         switch choice {
         case .cpu: return cpu
@@ -177,44 +175,20 @@ final class SLMEngine {
                                    qos: .userInitiated)
     }
 
-    /// Benchmark-only load options. `forcedDecodeTokens > 0` makes llama.cpp
-    /// decode exactly that many tokens and ignore EOS; 0 leaves decoding natural
-    /// while still collecting metrics. Benchmark instrumentation is a load-time
-    /// setting, hence a distinct load rather than a per-call flag.
-    struct BenchmarkOptions {
-        let forcedDecodeTokens: Int32
-    }
-
-    /// Set llama.cpp's log verbosity (process-wide). The benchmark sweep raises
-    /// this so a failed load's real reason reaches the console.
-    static func setRuntimeLogLevel(_ level: Int32) {
-        ChatLM.setLogLevel(level)
-    }
-
     /// Load the model once. `backend` defaults to `SLMBackend.preferred()` — Metal
-    /// unless a previous GPU load aborted (see `SLMBackend`). The benchmark
-    /// harness names a backend explicitly. `ChatLM` still forces CPU on the
-    /// simulator, which has no Metal compute device, so a `"gpu"` request there is
-    /// silently served on CPU.
+    /// unless a previous GPU load aborted (see `SLMBackend`). `ChatLM` still
+    /// forces CPU on the simulator, which has no Metal compute device, so a
+    /// `"gpu"` request there is silently served on CPU.
     ///
-    /// `benchmark` turns on llama.cpp's own timing; `activation` is accepted for
-    /// signature parity but ignored on llama.cpp (see `ChatLMActivationType`).
-    ///
-    /// `adapterPath` applies a LoRA language pack for the whole life of the load.
-    /// It is a LOAD parameter, not a per-call one, on purpose: adapters bind to
-    /// the llama context, so changing one mid-session would silently invalidate
-    /// every cached prompt prefix. Switching language means reloading the engine
-    /// — see `LoRACatalog` and the `loraPath:` note in ChatLM.h.
+    /// `adapterPath` is the engine's DEFAULT LoRA language pack: every call uses
+    /// it unless it names another (`complete(adapterPath:)`). See `LoRACatalog`
+    /// and the `loraPath:` note in ChatLM.h.
     func warmUp(modelName: String,
                 backend: String = SLMBackend.preferred(),
-                adapterPath: String? = nil,
-                benchmark: BenchmarkOptions? = nil,
-                activation: ChatLMActivationType = .auto) async -> (ok: Bool, error: String?) {
+                adapterPath: String? = nil) async -> (ok: Bool, error: String?) {
         guard let modelPath = ResourceLookup.path(modelName, ext: "gguf") else {
             return (false, "\(modelName).gguf not in bundle — drop it into Resources/.")
         }
-        // llama.cpp has no external kernel cache (LiteRT-LM used one); ChatLM
-        // ignores cacheDir, kept only for signature parity.
         return await withCheckedContinuation { cont in
             queue.async { [weak self] in
                 let b = ChatLM()
@@ -222,11 +196,7 @@ final class SLMEngine {
                 let ok = SLMBackend.guardingLoad(backend: backend) {
                     b.load(modelPath: modelPath,
                            backend: backend,
-                           cacheDir: nil,
-                           loraPath: adapterPath,
-                           enableBenchmark: benchmark != nil,
-                           forcedDecodeTokens: benchmark?.forcedDecodeTokens ?? 0,
-                           activation: activation)
+                           loraPath: adapterPath)
                 }
                 if Self.logPerf {
                     // Report the adapter that was ASKED FOR alongside the one that
@@ -255,9 +225,9 @@ final class SLMEngine {
 
     /// Release the loaded model, freeing its memory mapping. `warmUp` keeps the
     /// current model alive until a new one loads (so a failed switch can't kill
-    /// the features), which means both are mapped at once during a load — the
-    /// benchmark harness calls this first to measure each model's cost against a
-    /// clean baseline. Runs on the engine's queue, so in-flight work finishes.
+    /// the features), which means both are mapped at once during a load —
+    /// `ChatService.releaseSLMs` calls this first to avoid that. Runs on the
+    /// engine's queue, so in-flight work finishes.
     func unload() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
@@ -291,6 +261,17 @@ final class SLMEngine {
     func prewarmAdapter(path: String?) {
         guard let path else { return }
         queue.async { [weak self] in self?.bridge?.prewarmAdapter(path: path) }
+    }
+
+    /// Stop the generation running right now — a Stop button, a closed chat, or a
+    /// newer request making this one useless. See `ChatLM.cancel`.
+    ///
+    /// Deliberately NOT on the engine queue: that queue is blocked inside the very
+    /// generation being cancelled, so a queued cancel would only run after it
+    /// finished. The cancelled call still returns normally (its text so far,
+    /// `stop=cancelled` in `[SLMPerf]`); calls queued behind it are not affected.
+    func cancelCurrentGeneration() {
+        bridge?.cancel()
     }
 
     /// Blocking generation, serialized and off-main. Returns the trimmed reply.
@@ -356,45 +337,14 @@ final class SLMEngine {
         }
     }
 
-    /// Streamed generation that also returns llama.cpp's own metrics for the turn
-    /// — exact token counts and a wall-clock TTFT measured inside the bridge,
-    /// rather than inferred from callback timing. Requires a `warmUp(benchmark:)`
-    /// load; returns nil otherwise.
-    func streamMeasured(system: String?,
-                        history: [Turn],
-                        user: String,
-                        maxTokens: Int32,
-                        temperature: Float,
-                        onChunk: @escaping (_ chunk: String, _ done: Bool) -> Void)
-        async -> ChatLMBenchmarkInfo? {
-        await withCheckedContinuation { cont in
-            queue.async { [weak self] in
-                guard let bridge = self?.bridge else {
-                    onChunk("", true); cont.resume(returning: nil); return
-                }
-                let info = bridge.benchmarkStream(system: system,
-                                                  history: history,
-                                                  user: user,
-                                                  maxTokens: maxTokens,
-                                                  temperature: temperature,
-                                                  onChunk: onChunk)
-                if info == nil {
-                    NSLog("[SLMEngine] benchmarkStream → nil, lastError=%@", bridge.lastError)
-                }
-                cont.resume(returning: info)
-            }
-        }
-    }
-
     // MARK: - Perf logging
 
     /// Emit one `[SLMPerf]` line for the generation that just finished on
     /// `bridge`, e.g.
     ///
     /// ```
-    /// [SLMPerf] task/suggest-gemma3 | in=412 tok | prefill 0.884s (466.1 tok/s) |
-    /// ttft 0.951s | out=57 tok (188 chars) | decode 1.702s (33.5 tok/s) |
-    /// overhead 0.041s | TOTAL 2.627s | stop=eos | cap=160 temp=0.80
+    /// [SLMPerf] task/suggest qwen3(gpu) | ttft 0.951s | decode 33.5 tok/s |
+    /// TOTAL 2.627s | stop=eos | cap=160 temp=0.80
     /// ```
     ///
     /// `callSeconds` is measured in Swift and includes the bridge call itself, so
@@ -409,9 +359,11 @@ final class SLMEngine {
                   namespace, label, loadedModelName, callSeconds, bridge.lastError)
             return
         }
-        NSLog("[SLMPerf] %@/%@ %@(%@) | %@ | cap=%d temp=%.2f%@",
+        NSLog("[SLMPerf] %@/%@ %@(%@) | ttft %.3fs | decode %.1f tok/s | TOTAL %.3fs | "
+              + "stop=%@ | cap=%d temp=%.2f%@",
               namespace, label, loadedModelName, bridge.activeBackend,
-              m.summaryLine, maxTokens, temperature,
+              m.timeToFirstTokenSeconds, m.decodeTokensPerSecond, m.totalSeconds,
+              m.stopReason, maxTokens, temperature,
               callSeconds - m.totalSeconds > 0.05
                   ? String(format: " | callback +%.3fs", callSeconds - m.totalSeconds) : "")
     }

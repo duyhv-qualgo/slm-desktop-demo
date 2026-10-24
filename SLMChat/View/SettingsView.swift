@@ -236,12 +236,9 @@ struct SettingsView: View {
 
     /// Everything that is a tuning knob rather than a preference.
     ///
-    /// These four were top-level sections, which put a prompt-prefix cache toggle
-    /// and a benchmark harness at the same visual weight as Appearance. They are
-    /// not the same kind of thing: two exist for measurement and one reloads every
-    /// model when touched. Ordered everyday-first — a reply-suggestion toggle is
-    /// something a user might genuinely want; the diagnostics switch is something
-    /// you go looking for.
+    /// Kept apart from Appearance because the backend picker reloads every model
+    /// when touched. Ordered everyday-first — a reply-suggestion toggle is
+    /// something a user might genuinely want.
     private var advancedSettings: some View {
         Form {
                 Section {
@@ -277,15 +274,6 @@ struct SettingsView: View {
                     Text(backendFooter)
                 }
 
-
-                Section {
-                    NavigationLink("Benchmark") { BenchmarkView(service: store.service) }
-                } header: {
-                    Text("Developer")
-                } footer: {
-                    Text("Measures TTFT and decode throughput of each bundled SLM on this "
-                       + "device, and writes the runs to a CSV in Documents/.")
-                }
         }
         .formStyle(.grouped)
         .navigationTitle("Advanced")

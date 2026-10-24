@@ -431,15 +431,12 @@ final class ChatService {
                               : "Features on-device · no chat backend configured.", nil)
     }
 
-    // MARK: - Benchmark isolation
+    // MARK: - Engine release
 
-    /// Release the SLM engine so a benchmark can measure a model's memory cost
-    /// against a clean baseline. Without this the app's `taskEngine` already has
-    /// one benchmark checkpoint mapped, and a second mapping of the same file
-    /// shares physical pages — so that one model looks nearly free while the
-    /// others pay full price. The TFLite classifiers stay loaded (tens of MB, no
-    /// unload path). **The app's SLM features are dead until `restoreSLMs()` runs
-    /// — callers must pair the two.**
+    /// Unload the SLM engine, freeing its memory mapping — on quit, and before a
+    /// backend switch so two copies of the model are never mapped at once. **The
+    /// app's SLM features are dead until `restoreSLMs()` runs — callers that keep
+    /// running must pair the two.**
     func releaseSLMs() async {
         await taskEngine.unload()
     }
@@ -623,7 +620,7 @@ final class ChatService {
             score = String(format: " p_unsafe=%.3f", verdict.confidence)
         }
 
-        NSLog("[Guard] [%@] \"%@\" → %@%@ (%@ %@) %.1fms%@",
+        contentLog("[Guard] [%@] \"%@\" → %@%@ (%@ %@) %.1fms%@",
               language.name, String(text.prefix(60)),
               outcome, score,
               verdict.isUnsafe ? "FLAGGED" : "clean", verdict.source.logDescription, ms,
@@ -672,7 +669,7 @@ final class ChatService {
         let temp = summaryTemp
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             Task {
-                NSLog("[Summarize] STREAM — raw SLM input:\n%@", prompt)
+                contentLog("[Summarize] STREAM — raw SLM input:\n%@", prompt)
                 let box = SummaryBuffer()
                 await engine.stream(system: nil, history: [], user: prompt,
                                     maxTokens: maxTokens, temperature: temp,
@@ -684,7 +681,7 @@ final class ChatService {
                     }
                 }
                 let final = Prompts.parseSummary(box.text)
-                NSLog("[Summarize] STREAM done: %d chars: %@", final.count, final)
+                contentLog("[Summarize] STREAM done: %d chars: %@", final.count, final)
                 continuation.yield(final)
                 continuation.finish()
             }
@@ -731,7 +728,7 @@ final class ChatService {
             summaries = folded
         }
         let final = summaries.first
-        NSLog("[Summarize] DONE: final summary %d chars: %@",
+        contentLog("[Summarize] DONE: final summary %d chars: %@",
               final?.count ?? 0, final ?? "<nil>")
         return final
     }
@@ -993,7 +990,7 @@ final class ChatService {
     private static func warnIfTruncated(_ text: String, phase: String, index: Int) {
         guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last,
               !".!?…:;\"')」』".contains(last) else { return }
-        NSLog("[Summarize] WARNING %@ chunk %d ends mid-sentence (%d chars) — likely hit "
+        contentLog("[Summarize] WARNING %@ chunk %d ends mid-sentence (%d chars) — likely hit "
               + "the token cap. Every later fold now summarises damaged text: %@",
               phase, index, text.count, String(text.suffix(60)))
     }
@@ -1021,13 +1018,13 @@ final class ChatService {
         var out: [String] = []
         for (i, chunk) in chunks.enumerated() {
             let prompt = Prompts.summarizeText(chunk, language: language, speaker: speaker)
-            NSLog("[Summarize] %@ chunk %d/%d — raw SLM input:\n%@", phase, i + 1, chunks.count, prompt)
+            contentLog("[Summarize] %@ chunk %d/%d — raw SLM input:\n%@", phase, i + 1, chunks.count, prompt)
             if let raw = await taskEngine.complete(system: nil, history: [],
                                                    user: prompt,
                                                    maxTokens: maxTokens, temperature: summaryTemp,
                                                    label: .summarizeChunk(phase: phase)) {
                 let parsed = Prompts.parseSummary(raw)
-                NSLog("[Summarize] %@ chunk %d/%d (%d chars) → %d chars: %@",
+                contentLog("[Summarize] %@ chunk %d/%d (%d chars) → %d chars: %@",
                       phase, i + 1, chunks.count, chunk.count, parsed.count, parsed)
                 out.append(parsed)
             } else {
@@ -1072,7 +1069,7 @@ final class ChatService {
                 var completed: [String] = []
                 for (i, chunk) in chunks.enumerated() {
                     let prompt = Prompts.translate(chunk, from: source, to: target)
-                    NSLog("[Translate] STREAM chunk %d/%d — raw SLM input:\n%@",
+                    contentLog("[Translate] STREAM chunk %d/%d — raw SLM input:\n%@",
                           i + 1, chunks.count, prompt)
                     let box = SummaryBuffer()
                     await engine.stream(system: nil, history: [], user: prompt,
@@ -1106,7 +1103,7 @@ final class ChatService {
     /// the image can't be processed (attachment stays un-searchable, never blocks).
     func tagImage(_ data: Data) async -> [String] {
         let tags = await imageTagEngine.tag(imageData: data)
-        NSLog("[ImageTag] %d tags: %@", tags.count,
+        contentLog("[ImageTag] %d tags: %@", tags.count,
               tags.prefix(8).map { "\($0.name):\(String(format: "%.2f", $0.score))" }
                   .joined(separator: ", "))
         return tags.map(\.name)

@@ -25,7 +25,7 @@ final class OutputBudgetTests: XCTestCase {
         for option in ModelCatalog.taskModels where option.isAvailable {
             guard let path = ResourceLookup.path(option.resourceName, ext: "gguf") else { continue }
             let lm = ChatLM()
-            if lm.load(modelPath: path, backend: SLMBackend.cpu, cacheDir: nil, loraPath: nil) {
+            if lm.load(modelPath: path, backend: SLMBackend.cpu, loraPath: nil) {
                 out.append((option.id, lm))
             }
         }
@@ -107,18 +107,19 @@ final class MapChunkBudgetTests: XCTestCase {
             .flatMap { LoRACatalog.bundledPath(for: $0) }
         let lm = ChatLM()
         guard lm.load(modelPath: path, backend: SLMBackend.cpu,
-                      cacheDir: nil, loraPath: pack) else {
+                       loraPath: pack) else {
             throw XCTSkip("load failed: \(lm.lastError)")
         }
 
         let svc = ChatService()
         let prompt = Prompts.summarizeText(vietnameseChunk, language: "Vietnamese", speaker: "Mai")
-        _ = lm.generate(system: nil, history: [], user: prompt,
-                        maxTokens: svc.summaryMapTokens, temperature: 0.3, adapterPath: nil)
+        let out = lm.generate(system: nil, history: [], user: prompt,
+                              maxTokens: svc.summaryMapTokens, temperature: 0.3, adapterPath: nil) ?? ""
         let m = try XCTUnwrap(lm.lastTurnMetrics)
+        let outTokens = Int(lm.tokenCount(of: out))
 
-        print("MAPBUDGET in=\(vietnameseChunk.count) chars out=\(m.decodeTokenCount) tok "
-              + "(\(m.outputCharCount) chars) cap=\(svc.summaryMapTokens) stop=\(m.stopReason)")
+        print("MAPBUDGET in=\(vietnameseChunk.count) chars out=\(outTokens) tok "
+              + "(\(out.count) chars) cap=\(svc.summaryMapTokens) stop=\(m.stopReason)")
 
         XCTAssertEqual(m.stopReason, "eos",
                        "map chunk hit the token cap — its partial summary is truncated, and "
@@ -126,7 +127,7 @@ final class MapChunkBudgetTests: XCTestCase {
                        + "\(svc.summaryMapTokens))")
         // Headroom check: sitting right on the cap means the next slightly longer
         // chunk truncates, so the budget is only nominally sufficient.
-        XCTAssertLessThan(Double(m.decodeTokenCount), Double(svc.summaryMapTokens) * 0.85,
+        XCTAssertLessThan(Double(outTokens), Double(svc.summaryMapTokens) * 0.85,
                           "map output is within 15% of the cap — too little headroom")
     }
 }
@@ -179,7 +180,7 @@ final class OverlongPromptTests: XCTestCase {
             throw XCTSkip("No .gguf in the bundle.")
         }
         let lm = ChatLM()
-        guard lm.load(modelPath: path, backend: SLMBackend.cpu, cacheDir: nil, loraPath: nil) else {
+        guard lm.load(modelPath: path, backend: SLMBackend.cpu, loraPath: nil) else {
             throw XCTSkip("load failed: \(lm.lastError)")
         }
 

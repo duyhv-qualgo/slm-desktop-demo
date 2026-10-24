@@ -22,7 +22,7 @@ final class SummaryStreamShapeTests: XCTestCase {
                 .flatMap { LoRACatalog.bundledPath(for: $0) }
             let lm = ChatLM()
             guard lm.load(modelPath: path, backend: SLMBackend.cpu,
-                          cacheDir: nil, loraPath: pack) else { continue }
+                           loraPath: pack) else { continue }
             any = true
 
             let transcript = """
@@ -157,7 +157,7 @@ final class TranslateStreamTests: XCTestCase {
             .flatMap { LoRACatalog.bundledPath(for: $0) }
         let lm = ChatLM()
         guard lm.load(modelPath: path, backend: SLMBackend.cpu,
-                      cacheDir: nil, loraPath: pack) else {
+                       loraPath: pack) else {
             throw XCTSkip("load failed: \(lm.lastError)")
         }
 
